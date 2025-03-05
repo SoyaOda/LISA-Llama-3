@@ -2,9 +2,9 @@
 
 # DeepSpeedを使って複数GPUでデモを実行するスクリプト
 
-# ログレベルの設定（INFO=2, WARNING=3, ERROR=4, CRITICAL=5）
-# 値を大きくするとログが少なくなります
-export DEEPSPEED_LOGGER_LEVEL=4  # ERRORレベル以上のみ表示
+# DeepSpeedログレベル設定（1=INFO, 2=DEBUG, 3=WARNING, 4=ERROR, 5=CRITICAL）
+# エラーメッセージと埋め込み拡張関連のログ表示を確認するため、INFOレベルに設定
+export DEEPSPEED_LOGGER_LEVEL=1
 export DS_ACCELERATOR=cuda       # 明示的にアクセラレータを設定
 
 # 使用可能なGPUの数を取得
