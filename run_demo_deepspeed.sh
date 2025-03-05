@@ -2,6 +2,11 @@
 
 # DeepSpeedを使って8台のGPUでデモを実行するスクリプト
 
+# ログレベルの設定（INFO=2, WARNING=3, ERROR=4, CRITICAL=5）
+# 値を大きくするとログが少なくなります
+export DEEPSPEED_LOGGER_LEVEL=3  # WARNINGレベル以上のみ表示
+export DS_ACCELERATOR=cuda       # 明示的にアクセラレータを設定
+
 # 使用可能なGPUの数を取得
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "利用可能なGPU数: ${NUM_GPUS}"
@@ -37,6 +42,10 @@ fi
 OUTPUT_DIR="outputs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p $OUTPUT_DIR
 
+# ログファイルの設定
+LOG_FILE="${OUTPUT_DIR}/deepspeed_log.txt"
+echo "ログは ${LOG_FILE} に保存されます"
+
 echo "出力ディレクトリ: $OUTPUT_DIR"
 echo "プロンプト: $PROMPT"
 
@@ -48,6 +57,9 @@ done
 
 # GPUの数に応じてDeepSpeedのnprocを設定（最大8）
 NPROC=$(( NUM_GPUS > 8 ? 8 : NUM_GPUS ))
+if [ $NPROC -lt 1 ]; then
+    NPROC=1  # 少なくとも1つのGPUが必要
+fi
 
 echo "DeepSpeedを使用して${NPROC}台のGPUで実行します..."
 
@@ -57,9 +69,16 @@ if [ ! -z "$SAM_CHECKPOINT" ]; then
     SAM_OPTS="--sam_checkpoint $SAM_CHECKPOINT"
 fi
 
+# DS_CONFIGの存在確認
+if [ ! -f "ds_config.json" ]; then
+    echo "エラー: ds_config.json が見つかりません"
+    exit 1
+fi
+
 # メインのコマンド実行
 # nproc_per_nodeでGPUの数を指定し、deepspeedコマンドでマルチGPU実行
-deepspeed --num_gpus=$NPROC demo.py \
+# ログの詳細度を下げるためにquietオプションを追加
+deepspeed --num_gpus=$NPROC --no_local_rank --master_port $(( 10000 + RANDOM % 50000 )) demo.py \
     --model_path $MODEL_PATH \
     $SAM_OPTS \
     --image_path $IMAGE_PATH \
@@ -71,6 +90,11 @@ deepspeed --num_gpus=$NPROC demo.py \
     --beam_size 1 \
     --temp 0.2 \
     --top_p 0.7 \
-    $EXTRA_OPTS
+    $EXTRA_OPTS 2>&1 | tee $LOG_FILE
 
-echo "処理が完了しました。結果は $OUTPUT_DIR に保存されています。" 
+# 実行結果のチェック
+if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    echo "処理が完了しました。結果は $OUTPUT_DIR に保存されています。"
+else
+    echo "エラーが発生しました。ログファイル $LOG_FILE を確認してください。"
+fi 
