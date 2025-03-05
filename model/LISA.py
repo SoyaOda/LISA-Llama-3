@@ -383,11 +383,14 @@ class LISAForCausalLM(nn.Module):
                 print(f"SAM入力画像のシェイプ: {input_image_torch.shape}")
                 print(f"SAM入力画像のデータ型: {input_image_torch.dtype}")
                 
-                # DeepSpeed使用時はCPUからGPUへの移動をスキップ（DeepSpeedが管理）
-                if not self.use_deepspeed:
-                    device = self.sam.device
-                    input_image_torch = input_image_torch.to(device)
-                    print(f"SAM入力画像のデバイス: {input_image_torch.device}")
+                # 重要: 入力画像をSAMモデルと同じデバイスに移動
+                # SAMモデルのデバイスを取得
+                sam_device = next(self.sam.parameters()).device
+                print(f"SAMモデルのデバイス: {sam_device}")
+                
+                # 画像をSAMモデルと同じデバイスに移動（DeepSpeedの場合でも）
+                input_image_torch = input_image_torch.to(sam_device)
+                print(f"SAM入力画像のデバイス: {input_image_torch.device}")
                 
                 # SAMのimage_encoderを使用して画像埋め込みを作成
                 with torch.no_grad():
