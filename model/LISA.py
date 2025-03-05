@@ -371,11 +371,21 @@ class LISAForCausalLM(nn.Module):
             print(
                 f"画像をパディングしました: 1024x{int(1024*h/w)} -> {input_size[0]}x{input_size[1]}")
 
+            # 最初にnumpy配列をuint8からfloat32に変換
+            input_image = input_image.astype(np.float32) / 255.0
+            
             input_image_torch = torch.as_tensor(
                 input_image, device=self.device)
+            
+            # モデルが半精度の場合、入力も半精度に変換
+            if next(self.sam.parameters()).dtype == torch.float16:
+                print("入力画像を半精度(float16)に変換します")
+                input_image_torch = input_image_torch.to(torch.float16)
+            
             input_image_torch = input_image_torch.permute(
                 2, 0, 1).contiguous()[None, :, :, :]
             print(f"SAM入力画像のシェイプ: {input_image_torch.shape}")
+            print(f"SAM入力画像のデータ型: {input_image_torch.dtype}")
 
             # デバイスの明示的な指定
             if hasattr(self.sam, 'image_encoder'):
