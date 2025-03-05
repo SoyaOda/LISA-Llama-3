@@ -507,39 +507,46 @@ class LISAForCausalLM(nn.Module):
                     if isinstance(v, torch.Tensor):
                         model_inputs[k] = v.to(model_device)
                 
-                # aspect_ratio_idsが正しくないか欠けている場合に対応
-                if 'aspect_ratio_ids' not in model_inputs or model_inputs['aspect_ratio_ids'].shape[-1] != model_inputs['pixel_values'].shape[1]:
+                # pixel_valuesの形状を正確に確認し修正
+                print(f"修正前のpixel_values形状: {model_inputs['pixel_values'].shape}")
+                
+                # Llama 3.2 Visionは6次元のpixel_values形状を期待:
+                # [batch_size, num_concurrent_media, num_tiles, num_channels, height, width]
+                if len(model_inputs['pixel_values'].shape) == 5:
+                    # 5次元から6次元に変換 - num_concurrent_mediaの次元を追加
+                    # 例: [B, P, C, H, W] -> [B, 1, P, C, H, W]
+                    model_inputs['pixel_values'] = model_inputs['pixel_values'].unsqueeze(1)
+                    print(f"5次元から6次元に変更後のpixel_values形状: {model_inputs['pixel_values'].shape}")
+                elif len(model_inputs['pixel_values'].shape) > 6:
+                    # 次元が多すぎる場合は適切に調整
+                    print(f"異常な次元数のpixel_values: {model_inputs['pixel_values'].shape}")
+                    # 必要に応じて他の変換を追加
+                
+                # aspect_ratio_idsを確認・修正
+                if 'aspect_ratio_ids' not in model_inputs:
                     print("aspect_ratio_idsを作成します")
+                    # num_concurrent_mediaの次元に合わせて作成
+                    batch_size = model_inputs['pixel_values'].shape[0]
+                    num_concurrent_media = model_inputs['pixel_values'].shape[1]
                     model_inputs['aspect_ratio_ids'] = torch.zeros(
-                        (model_inputs['pixel_values'].shape[0], model_inputs['pixel_values'].shape[1]),
+                        (batch_size, num_concurrent_media),
                         dtype=torch.long, device=model_device
                     )
                 
-                # aspect_ratio_maskが正しくないか欠けている場合に対応 
+                # aspect_ratio_maskの確認・修正
                 if 'aspect_ratio_mask' not in model_inputs:
                     print("aspect_ratio_maskを作成します")
-                    # 典型的にはpixel_valuesの最後から2次元目のサイズに合わせる
-                    if len(model_inputs['pixel_values'].shape) >= 5:
-                        num_patches = model_inputs['pixel_values'].shape[-3]  # 通常のパッチ数
-                        model_inputs['aspect_ratio_mask'] = torch.ones(
-                            (model_inputs['pixel_values'].shape[0], 1, num_patches),
-                            dtype=torch.long, device=model_device
-                        )
+                    batch_size = model_inputs['pixel_values'].shape[0]
+                    num_concurrent_media = model_inputs['pixel_values'].shape[1]
+                    model_inputs['aspect_ratio_mask'] = torch.ones(
+                        (batch_size, num_concurrent_media),
+                        dtype=torch.bool, device=model_device
+                    )
                 
-                # pixel_valuesの形状を確認し、必要なら修正
-                if len(model_inputs['pixel_values'].shape) > 5:
-                    # 次元が多すぎる場合、reshape
-                    print(f"pixel_valuesの形状を修正します: {model_inputs['pixel_values'].shape}")
-                    pixel_shape = model_inputs['pixel_values'].shape
-                    if len(pixel_shape) == 6:  # [B, 1, P, C, H, W]
-                        # [B, P, C, H, W]の形式に変更
-                        model_inputs['pixel_values'] = model_inputs['pixel_values'].squeeze(1)
-                        print(f"修正後のpixel_values形状: {model_inputs['pixel_values'].shape}")
-                
-                # 入力テンソルの形状とデバイスを確認
+                # 最終確認: すべてのテンソルの形状とデバイスを出力
                 for k, v in model_inputs.items():
                     if isinstance(v, torch.Tensor):
-                        print(f"モデル入力 {k}: 形状={v.shape}, デバイス={v.device}")
+                        print(f"最終的なモデル入力 {k}: 形状={v.shape}, デバイス={v.device}")
                 
                 # テキスト生成
                 try:
@@ -636,12 +643,24 @@ class LISAForCausalLM(nn.Module):
 
                             # フォワードパスを実行して隠れ状態を取得
                             with torch.no_grad():
+                                # pixel_valuesやaspect_ratio関連のテンソルが正しい形状であることを確認
+                                # batch_size=1に制限して取得
+                                pixel_values_segment = model_inputs['pixel_values'][0:1]
+                                aspect_ratio_ids_segment = model_inputs['aspect_ratio_ids'][0:1] if 'aspect_ratio_ids' in model_inputs else None
+                                aspect_ratio_mask_segment = model_inputs['aspect_ratio_mask'][0:1] if 'aspect_ratio_mask' in model_inputs else None
+                                
+                                print(f"フォワードパス用 pixel_values: 形状={pixel_values_segment.shape}")
+                                if aspect_ratio_ids_segment is not None:
+                                    print(f"フォワードパス用 aspect_ratio_ids: 形状={aspect_ratio_ids_segment.shape}")
+                                if aspect_ratio_mask_segment is not None:
+                                    print(f"フォワードパス用 aspect_ratio_mask: 形状={aspect_ratio_mask_segment.shape}")
+                                
                                 outputs = self.model(
                                     input_ids=input_ids_segment,
                                     attention_mask=attention_mask_segment,
-                                    pixel_values=model_inputs['pixel_values'],
-                                    aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
-                                    aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
+                                    pixel_values=pixel_values_segment,
+                                    aspect_ratio_ids=aspect_ratio_ids_segment,
+                                    aspect_ratio_mask=aspect_ratio_mask_segment,
                                     output_hidden_states=True,
                                     return_dict=True
                                 )
