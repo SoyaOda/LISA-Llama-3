@@ -420,8 +420,9 @@ class LISAForCausalLM(nn.Module):
             生成されたセグメンテーション結果
         """
         try:
-            # デバイスの設定（DeepSpeed使用時は不要）
-            device = next(self.model.parameters()).device if not self.use_deepspeed else None
+            # モデルのデバイスを取得（DeepSpeed使用時も同様）
+            model_device = next(self.model.parameters()).device
+            print(f"モデルのデバイス: {model_device}")
             
             # 生成パラメータ
             temperature = kwargs.get("temperature", 0.1)
@@ -450,9 +451,6 @@ class LISAForCausalLM(nn.Module):
             input_text = "<|begin_of_chat|>\n<|user|>\n<|image|>\n" + prompt + "\n<|assistant|>"
             print(f"構築されたテキスト入力: {input_text}")
             
-            # プロセッサを使用してテキストと画像を一緒に処理
-            # プロセッサを使用して画像と入力テキストを処理
-            # 画像をプロセッサを使って正しい形式に変換
             try:
                 # フルのプロセッサを使用して正しい形式にする
                 inputs = self.processor(
@@ -465,12 +463,19 @@ class LISAForCausalLM(nn.Module):
                 print(f"プロセッサによる入力テンソルの形状:")
                 for key, tensor in inputs.items():
                     if isinstance(tensor, torch.Tensor):
-                        print(f"{key}: {tensor.shape}")
+                        print(f"{key}: {tensor.shape}, device: {tensor.device}")
                 
-                # DeepSpeed使用時は入力をモデルのデバイスに移動しない（DeepSpeedが管理）
-                if not self.use_deepspeed and device is not None:
-                    inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
-                    print(f"入力テンソルをデバイス {device} に移動しました")
+                # 重要: DeepSpeed使用時でも全ての入力テンソルをモデルと同じデバイスに移動
+                # これにより「Expected all tensors to be on the same device」エラーを回避
+                inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v 
+                          for k, v in inputs.items()}
+                
+                print(f"入力テンソルをデバイス {model_device} に移動しました")
+                
+                # デバイス移動後の確認
+                for key, tensor in inputs.items():
+                    if isinstance(tensor, torch.Tensor):
+                        print(f"移動後 {key}: device: {tensor.device}")
                 
                 try:
                     # DeepSpeedまたは通常環境での生成
@@ -526,10 +531,10 @@ class LISAForCausalLM(nn.Module):
                 else:
                     raise ValueError("imageはPIL.Imageである必要があります")
                     
-                # DeepSpeed使用時はテンソルをCPUからGPUに移動しない（DeepSpeedが管理）
-                if not self.use_deepspeed and device is not None:
-                    pixel_values = pixel_values.to(device)
-                    tokenized_text = {k: v.to(device) for k, v in tokenized_text.items()}
+                # 重要: DeepSpeed使用時でも全てのテンソルをモデルと同じデバイスに移動
+                pixel_values = pixel_values.to(model_device)
+                tokenized_text = {k: v.to(model_device) for k, v in tokenized_text.items()}
+                print(f"テンソルをデバイス {model_device} に移動しました")
                 
                 # 入力辞書を作成
                 inputs = {
@@ -537,14 +542,14 @@ class LISAForCausalLM(nn.Module):
                     "attention_mask": tokenized_text["attention_mask"],
                     "pixel_values": pixel_values,
                     # アスペクト比IDとマスクはLlama 3.2 Vision仕様に合わせて計算
-                    "aspect_ratio_ids": torch.zeros_like(tokenized_text["input_ids"]),
-                    "aspect_ratio_mask": torch.ones_like(tokenized_text["input_ids"]),
+                    "aspect_ratio_ids": torch.zeros_like(tokenized_text["input_ids"]).to(model_device),
+                    "aspect_ratio_mask": torch.ones_like(tokenized_text["input_ids"]).to(model_device),
                 }
                 
-                # 入力テンソルの形状を表示
+                # 入力テンソルの形状とデバイスを表示
                 for key, tensor in inputs.items():
                     if isinstance(tensor, torch.Tensor):
-                        print(f"入力テンソル {key} の形状: {tensor.shape}")
+                        print(f"入力テンソル {key} の形状: {tensor.shape}, デバイス: {tensor.device}")
                 
                 try:
                     # 生成を実行
