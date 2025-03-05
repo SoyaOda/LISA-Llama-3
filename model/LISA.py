@@ -464,61 +464,61 @@ class LISAForCausalLM(nn.Module):
             print(f"入力テキスト: {input_text}")
 
             try:
-                # プロンプトをトークン化
-                tokenized_text = self.processor(
-                    input_text, return_tensors="pt")
-
-                # 画像をPIL形式から変換（ただしMllamaの形式に変換）
-                pixel_values = self.processor(
-                    images=image, return_tensors="pt").pixel_values
-                print(f"画像ピクセル値: 形状={pixel_values.shape}")
-
-                # aspect_ratio_ids と aspect_ratio_mask を取得
+                # 画像とテキストを同時に処理（Llama 3.2 Visionでの正しい使用方法）
+                print("画像とテキストを同時に処理します...")
+                inputs = self.processor(
+                    images=image,  # PIL画像または適切な形式の画像
+                    text=input_text,
+                    return_tensors="pt"
+                )
+                
+                # 各テンソルをモデルのデバイスに移動
+                for k, v in inputs.items():
+                    inputs[k] = v.to(self.device)
+                
+                # デバッグ用に形状とデバイスを表示
+                for k, v in inputs.items():
+                    if hasattr(v, 'shape'):
+                        print(f"入力 {k}: 形状={v.shape}, デバイス={v.device}")
+                    else:
+                        print(f"入力 {k}: 型={type(v)}")
+                
+                # aspect_ratio_ids と aspect_ratio_mask を確認
                 # これらがプロセッサから返されない場合は作成する
-                if hasattr(tokenized_text, 'aspect_ratio_ids'):
-                    aspect_ratio_ids = tokenized_text.aspect_ratio_ids
-                    aspect_ratio_mask = tokenized_text.aspect_ratio_mask
-                else:
-                    # aspect_ratio_idsとaspect_ratio_maskがない場合は0と1で埋める
-                    aspect_ratio_ids = torch.zeros_like(
-                        tokenized_text.input_ids)
-                    aspect_ratio_mask = torch.ones_like(
-                        tokenized_text.input_ids)
-
-                # すべての入力をGPUに移動
-                input_ids = tokenized_text.input_ids.to(model_device)
-                attention_mask = tokenized_text.attention_mask.to(model_device)
-                pixel_values = pixel_values.to(model_device)
-                aspect_ratio_ids = aspect_ratio_ids.to(model_device)
-                aspect_ratio_mask = aspect_ratio_mask.to(model_device)
+                if 'aspect_ratio_ids' not in inputs:
+                    print("aspect_ratio_idsが見つかりません。作成します...")
+                    # 入力IDsと同じサイズの0埋めtensorを作成
+                    inputs['aspect_ratio_ids'] = torch.zeros_like(inputs['input_ids'])
+                    inputs['aspect_ratio_mask'] = torch.ones_like(inputs['input_ids'])
 
                 # クロスアテンションマスクの作成（必要な場合）
-                if hasattr(tokenized_text, 'cross_attention_mask'):
-                    cross_attention_mask = tokenized_text.cross_attention_mask.to(
-                        model_device)
-                    inputs = {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "pixel_values": pixel_values,
-                        "aspect_ratio_ids": aspect_ratio_ids,
-                        "aspect_ratio_mask": aspect_ratio_mask,
+                model_device = next(self.model.parameters()).device
+                if 'cross_attention_mask' in inputs:
+                    # 辞書アクセスに変更（属性アクセスではなく）
+                    cross_attention_mask = inputs['cross_attention_mask'].to(model_device)
+                    modified_inputs = {
+                        "input_ids": inputs['input_ids'],
+                        "attention_mask": inputs['attention_mask'],
+                        "pixel_values": inputs['pixel_values'],
+                        "aspect_ratio_ids": inputs['aspect_ratio_ids'],
+                        "aspect_ratio_mask": inputs['aspect_ratio_mask'],
                         "cross_attention_mask": cross_attention_mask
                     }
                 else:
-                    inputs = {
-                        "input_ids": input_ids,
-                        "attention_mask": attention_mask,
-                        "pixel_values": pixel_values,
-                        "aspect_ratio_ids": aspect_ratio_ids,
-                        "aspect_ratio_mask": aspect_ratio_mask
+                    modified_inputs = {
+                        "input_ids": inputs['input_ids'],
+                        "attention_mask": inputs['attention_mask'],
+                        "pixel_values": inputs['pixel_values'],
+                        "aspect_ratio_ids": inputs['aspect_ratio_ids'],
+                        "aspect_ratio_mask": inputs['aspect_ratio_mask']
                     }
 
-                print(f"入力形状: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}, "
-                      f"pixel_values={pixel_values.shape}, aspect_ratio_ids={aspect_ratio_ids.shape}, "
-                      f"aspect_ratio_mask={aspect_ratio_mask.shape}")
-                print(f"入力デバイス: input_ids={input_ids.device}, attention_mask={attention_mask.device}, "
-                      f"pixel_values={pixel_values.device}, aspect_ratio_ids={aspect_ratio_ids.device}, "
-                      f"aspect_ratio_mask={aspect_ratio_mask.device}")
+                print(f"入力形状: input_ids={modified_inputs['input_ids'].shape}, attention_mask={modified_inputs['attention_mask'].shape}, "
+                      f"pixel_values={modified_inputs['pixel_values'].shape}, aspect_ratio_ids={modified_inputs['aspect_ratio_ids'].shape}, "
+                      f"aspect_ratio_mask={modified_inputs['aspect_ratio_mask'].shape}")
+                print(f"入力デバイス: input_ids={modified_inputs['input_ids'].device}, attention_mask={modified_inputs['attention_mask'].device}, "
+                      f"pixel_values={modified_inputs['pixel_values'].device}, aspect_ratio_ids={modified_inputs['aspect_ratio_ids'].device}, "
+                      f"aspect_ratio_mask={modified_inputs['aspect_ratio_mask'].device}")
 
                 try:
                     # deepspeedを使用している場合の処理
@@ -526,7 +526,7 @@ class LISAForCausalLM(nn.Module):
                         print("DeepSpeed環境でgenerateを実行します")
                         try:
                             generate_outputs = self.model.module.generate(
-                                **inputs,
+                                **modified_inputs,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
@@ -544,7 +544,7 @@ class LISAForCausalLM(nn.Module):
                             # フォールバック: 非DeepSpeed方式で試す
                             print("フォールバック: 非DeepSpeed方式でgenerateを実行します")
                             generate_outputs = self.model.generate(
-                                **inputs,
+                                **modified_inputs,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
@@ -559,7 +559,7 @@ class LISAForCausalLM(nn.Module):
                         # 通常のgenerateメソッド
                         print("通常環境でgenerateを実行します")
                         generate_outputs = self.model.generate(
-                            **inputs,
+                            **modified_inputs,
                             max_new_tokens=max_new_tokens,
                             do_sample=do_sample,
                             temperature=temperature,
@@ -609,7 +609,7 @@ class LISAForCausalLM(nn.Module):
                                 forward_inputs = {
                                     "input_ids": generate_ids,
                                     "attention_mask": torch.ones_like(generate_ids),
-                                    "pixel_values": pixel_values,
+                                    "pixel_values": image_embedding,
                                     "aspect_ratio_ids": torch.zeros_like(generate_ids).to(model_device),
                                     "aspect_ratio_mask": torch.ones_like(generate_ids).to(model_device),
                                     "output_hidden_states": True,
@@ -730,7 +730,7 @@ class LISAForCausalLM(nn.Module):
                                         outputs = self.model(
                                             input_ids=input_ids_segment,
                                             attention_mask=attention_mask_segment,
-                                            pixel_values=pixel_values,
+                                            pixel_values=image_embedding,
                                             aspect_ratio_ids=torch.zeros_like(
                                                 input_ids_segment).to(model_device),
                                             aspect_ratio_mask=torch.ones_like(
