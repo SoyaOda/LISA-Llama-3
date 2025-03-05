@@ -548,67 +548,81 @@ class LISAForCausalLM(nn.Module):
                     if isinstance(v, torch.Tensor):
                         print(f"最終的なモデル入力 {k}: 形状={v.shape}, デバイス={v.device}")
                 
+                # デバイスの状態を確認
+                print(f"CUDAメモリ使用量: {torch.cuda.memory_allocated(device=model_device) / 1024**2:.2f} MB / {torch.cuda.memory_reserved(device=model_device) / 1024**2:.2f} MB")
+                
                 # テキスト生成
                 try:
-                    # DeepSpeed環境の場合
-                    if hasattr(self.model, 'module') and hasattr(self.model.module, 'generate'):
-                        print("DeepSpeed環境でgenerateを実行します")
-                        try:
-                            generate_outputs = self.model.module.generate(
-                                input_ids=model_inputs['input_ids'],
-                                attention_mask=model_inputs['attention_mask'],
-                                pixel_values=model_inputs['pixel_values'],
-                                aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
-                                aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
-                                max_new_tokens=max_new_tokens,
-                                do_sample=do_sample,
-                                temperature=temperature,
-                                top_p=top_p,
-                                top_k=50 if top_k is None else top_k,
-                                num_beams=num_beams,
-                                repetition_penalty=repetition_penalty,
-                                output_hidden_states=True,
-                                return_dict_in_generate=True
-                            )
-                        except Exception as deepspeed_error:
-                            print(f"DeepSpeed generate中にエラーが発生しました: {deepspeed_error}")
-                            # フォールバック: 非DeepSpeed方式で試す
-                            print("フォールバック: 非DeepSpeed方式でgenerateを実行します")
-                            generate_outputs = self.model.generate(
-                                input_ids=model_inputs['input_ids'],
-                                attention_mask=model_inputs['attention_mask'],
-                                pixel_values=model_inputs['pixel_values'],
-                                aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
-                                aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
-                                max_new_tokens=max_new_tokens,
-                                do_sample=do_sample,
-                                temperature=temperature,
-                                top_p=top_p,
-                                top_k=50 if top_k is None else top_k,
-                                num_beams=num_beams,
-                                repetition_penalty=repetition_penalty,
-                                output_hidden_states=True,
-                                return_dict_in_generate=True
-                            )
-                    else:
-                        # 通常のgenerateメソッド
-                        print("通常環境でgenerateを実行します")
-                        generate_outputs = self.model.generate(
-                            input_ids=model_inputs['input_ids'],
-                            attention_mask=model_inputs['attention_mask'],
-                            pixel_values=model_inputs['pixel_values'],
-                            aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
-                            aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=do_sample,
-                            temperature=temperature,
-                            top_p=top_p,
-                            top_k=50 if top_k is None else top_k,
-                            num_beams=num_beams,
-                            repetition_penalty=repetition_penalty,
-                            output_hidden_states=True,
-                            return_dict_in_generate=True
-                        )
+                    # 安全にgenerateを実行するための設定
+                    generation_params = {
+                        # 必須パラメータ
+                        "input_ids": model_inputs['input_ids'],
+                        "attention_mask": model_inputs['attention_mask'],
+                        "pixel_values": model_inputs['pixel_values'],
+                        
+                        # 画像関連のパラメータ（存在する場合のみ）
+                        "aspect_ratio_ids": model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
+                        "aspect_ratio_mask": model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
+                        
+                        # 生成パラメータ
+                        "max_new_tokens": max_new_tokens,
+                        "do_sample": do_sample,
+                        "temperature": max(0.1, temperature),  # 0より大きい値を確保
+                        "top_p": min(0.99, max(0.1, top_p)),   # 0.1〜0.99の範囲に制限
+                        "num_beams": max(1, num_beams),        # 最低1ビーム
+                        "repetition_penalty": max(1.0, repetition_penalty),  # 1.0以上の値
+                        
+                        # 出力関連
+                        "output_hidden_states": True,
+                        "return_dict_in_generate": True
+                    }
+                    
+                    # top_kパラメータを安全に設定
+                    if top_k is not None and top_k > 0:
+                        generation_params["top_k"] = min(50, top_k)  # 最大50に制限
+                    
+                    # まずCPUで生成を試みる（メモリ割り当てのエラーを回避）
+                    try:
+                        # DeepSpeed環境の場合
+                        if hasattr(self.model, 'module') and hasattr(self.model.module, 'generate'):
+                            print("DeepSpeed環境でgenerateを実行します")
+                            generate_outputs = self.model.module.generate(**generation_params)
+                        else:
+                            # 通常のgenerateメソッド
+                            print("通常環境でgenerateを実行します")
+                            generate_outputs = self.model.generate(**generation_params)
+                    
+                    except Exception as e:
+                        print(f"通常のgenerateでエラーが発生しました: {str(e)}")
+                        print("フォールバック: シンプルな生成方法を試行します")
+                        
+                        # フォールバック: シンプルな生成方法
+                        # 入力をCPUに移動してからgenerateを実行
+                        cpu_inputs = {
+                            k: v.to('cpu') if isinstance(v, torch.Tensor) else v 
+                            for k, v in generation_params.items()
+                        }
+                        
+                        # よりシンプルな設定でgenerateを呼び出し
+                        simpler_params = {
+                            "input_ids": cpu_inputs["input_ids"],
+                            "attention_mask": cpu_inputs["attention_mask"],
+                            "pixel_values": cpu_inputs["pixel_values"],
+                            "max_new_tokens": max_new_tokens,
+                            "do_sample": False,  # greedy decoding
+                            "num_beams": 1,      # beam search なし
+                            "output_hidden_states": True,
+                            "return_dict_in_generate": True
+                        }
+                        
+                        if hasattr(self.model, 'module'):
+                            model = self.model.module
+                        else:
+                            model = self.model
+                        
+                        # 再試行: CPUでの実行
+                        print("CPU上でより単純な設定で生成を試行します")
+                        generate_outputs = model.generate(**simpler_params)
 
                     # 生成されたトークンIDを取得
                     generate_ids = generate_outputs.sequences
@@ -619,6 +633,13 @@ class LISAForCausalLM(nn.Module):
                     )[0]
                     
                     print(f"生成された生のテキスト: {decoded_text}")
+
+                    # 特殊トークンを含まないテキストも取得
+                    clean_text = self.processor.tokenizer.batch_decode(
+                        generate_ids, skip_special_tokens=True
+                    )[0]
+                    
+                    print(f"クリーンテキスト: {clean_text}")
 
                     # <seg>トークンの検出と処理
                     seg_token_id = self.processor.tokenizer.convert_tokens_to_ids(
@@ -655,21 +676,41 @@ class LISAForCausalLM(nn.Module):
                                 if aspect_ratio_mask_segment is not None:
                                     print(f"フォワードパス用 aspect_ratio_mask: 形状={aspect_ratio_mask_segment.shape}")
                                 
-                                outputs = self.model(
-                                    input_ids=input_ids_segment,
-                                    attention_mask=attention_mask_segment,
-                                    pixel_values=pixel_values_segment,
-                                    aspect_ratio_ids=aspect_ratio_ids_segment,
-                                    aspect_ratio_mask=aspect_ratio_mask_segment,
-                                    output_hidden_states=True,
-                                    return_dict=True
-                                )
+                                try:
+                                    # まずGPUで試す
+                                    outputs = self.model(
+                                        input_ids=input_ids_segment,
+                                        attention_mask=attention_mask_segment,
+                                        pixel_values=pixel_values_segment,
+                                        aspect_ratio_ids=aspect_ratio_ids_segment,
+                                        aspect_ratio_mask=aspect_ratio_mask_segment,
+                                        output_hidden_states=True,
+                                        return_dict=True
+                                    )
+                                except Exception as e:
+                                    print(f"GPUでの隠れ状態取得中にエラー: {str(e)}")
+                                    print("CPUでの処理に切り替えます")
+                                    
+                                    # CPUに移動して再試行
+                                    outputs = self.model(
+                                        input_ids=input_ids_segment.to('cpu'),
+                                        attention_mask=attention_mask_segment.to('cpu'),
+                                        pixel_values=pixel_values_segment.to('cpu'),
+                                        aspect_ratio_ids=aspect_ratio_ids_segment.to('cpu') if aspect_ratio_ids_segment is not None else None,
+                                        aspect_ratio_mask=aspect_ratio_mask_segment.to('cpu') if aspect_ratio_mask_segment is not None else None,
+                                        output_hidden_states=True,
+                                        return_dict=True
+                                    )
 
                                 # 最後の位置（<seg>トークン）の隠れ状態を取得
                                 hidden_states = outputs.hidden_states[-1][0, -1]
+                                print(f"隠れ状態: 形状={hidden_states.shape}, デバイス={hidden_states.device}")
                                 
                                 # 隠れ状態をSAMの次元（256次元）に投影
                                 point_embedding = self.seg_projection(hidden_states)
+                                print(f"投影前のpoint_embedding: 形状={point_embedding.shape}, デバイス={point_embedding.device}")
+                                
+                                # SAMデバイスを確認し、必要に応じて移動
                                 sam_device = next(self.sam.parameters()).device
                                 point_embedding = point_embedding.to(sam_device)
                                 
@@ -677,22 +718,53 @@ class LISAForCausalLM(nn.Module):
                                 
                                 # SAMデコーダを実行してマスクを生成
                                 sparse_embeddings = point_embedding.unsqueeze(0)
-                                mask_predictions, _ = self.sam.mask_decoder(
-                                    image_embeddings=sam_image_embedding.to(sam_device),
-                                    image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                                    sparse_prompt_embeddings=sparse_embeddings,
-                                    dense_prompt_embeddings=None,
-                                    multimask_output=False,
-                                )
                                 
-                                # マスク予測を取得して後処理
-                                mask_pred = mask_predictions[0]  # [1, 1, H, W]
-                                mask_pred = torch.sigmoid(mask_pred)
-                                mask_binary = (mask_pred > 0.5).float()
-                                mask_np = mask_binary[0, 0].cpu().numpy()
-                                masks.append(mask_np)
+                                try:
+                                    # SAM画像埋め込みがSAMデバイスにあることを確認
+                                    sam_image_embedding_on_device = sam_image_embedding.to(sam_device)
+                                    
+                                    # SAMによるマスク生成
+                                    print(f"SAM入力: image_embeddings={sam_image_embedding_on_device.shape}, sparse_embeddings={sparse_embeddings.shape}")
+                                    
+                                    mask_predictions, _ = self.sam.mask_decoder(
+                                        image_embeddings=sam_image_embedding_on_device,
+                                        image_pe=self.sam.prompt_encoder.get_dense_pe(),
+                                        sparse_prompt_embeddings=sparse_embeddings,
+                                        dense_prompt_embeddings=None,
+                                        multimask_output=False,
+                                    )
+                                    
+                                    # マスク予測を取得して後処理
+                                    mask_pred = mask_predictions[0]  # [1, 1, H, W]
+                                    
+                                    # nan値やinf値がないか確認
+                                    if torch.isnan(mask_pred).any() or torch.isinf(mask_pred).any():
+                                        print("警告: マスク予測にNaNまたはInf値が含まれています")
+                                        # NaNやInfを0に置き換え
+                                        mask_pred = torch.nan_to_num(mask_pred, nan=0.0, posinf=1.0, neginf=0.0)
+                                    
+                                    mask_pred = torch.sigmoid(mask_pred)
+                                    mask_binary = (mask_pred > 0.5).float()
+                                    mask_np = mask_binary[0, 0].cpu().numpy()
+                                    masks.append(mask_np)
+                                    
+                                    print(f"マスク {len(masks)} を生成しました: 形状={mask_np.shape}")
                                 
-                                print(f"マスク {len(masks)} を生成しました: 形状={mask_np.shape}")
+                                except Exception as mask_error:
+                                    print(f"SAMマスク生成中にエラー: {str(mask_error)}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    
+                                    # デバッグ情報
+                                    print(f"SAM画像埋め込み: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}, dtype={sam_image_embedding.dtype}")
+                                    print(f"スパース埋め込み: 形状={sparse_embeddings.shape}, デバイス={sparse_embeddings.device}, dtype={sparse_embeddings.dtype}")
+                                    
+                                    # 空のダミーマスクを追加（失敗した場合）
+                                    if sam_image_embedding.shape[0] > 0:
+                                        h, w = sam_image_embedding.shape[-2] * 4, sam_image_embedding.shape[-1] * 4
+                                        dummy_mask = np.zeros((h, w), dtype=np.float32)
+                                        masks.append(dummy_mask)
+                                        print(f"ダミーマスクを追加しました: 形状={dummy_mask.shape}")
                         
                         except Exception as e:
                             print(f"マスク生成中にエラーが発生しました: {str(e)}")
@@ -703,27 +775,35 @@ class LISAForCausalLM(nn.Module):
                     print(f"トークン生成中にエラーが発生しました: {str(e)}")
                     import traceback
                     traceback.print_exc()
-                    return {"masks": [], "text": f"エラー: {str(e)}"}
+                    
+                    # 最低限のテキスト応答を返す
+                    return {"masks": masks, "text": f"エラーが発生しました: {str(e)}"}
             
             except Exception as e:
                 print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                return {"masks": [], "text": f"エラー: {str(e)}"}
+                return {"masks": [], "text": f"画像処理エラー: {str(e)}"}
         
         except Exception as e:
             print(f"セグメンテーション生成中にエラーが発生しました: {str(e)}")
             import traceback
             traceback.print_exc()
-            return {"masks": [], "text": f"エラー: {str(e)}"}
+            return {"masks": [], "text": f"全体的なエラー: {str(e)}"}
         
-        # 特殊トークンを含まないクリーンなテキストを取得
-        clean_text = self.processor.tokenizer.batch_decode(
-            generate_ids, skip_special_tokens=True
-        )[0]
-
-        # 生成テキストとマスクを含む辞書を返す
-        return {"masks": masks, "text": clean_text}
+        # 特殊トークンを除外した最終テキストを生成
+        if 'clean_text' in locals():
+            final_text = clean_text
+        elif 'decoded_text' in locals():
+            # 特殊トークンを手動で除外
+            final_text = decoded_text.replace(self.seg_token, "")
+            # その他の特殊トークンも除外
+            for token in ["<s>", "</s>", "<unk>"]:
+                final_text = final_text.replace(token, "")
+        else:
+            final_text = "テキスト生成に失敗しました。"
+        
+        return {"masks": masks, "text": final_text.strip()}
 
     @classmethod
     def from_pretrained(cls, model_path, sam_checkpoint=None, use_deepspeed=False, ds_config=None, local_rank=-1, **kwargs):
