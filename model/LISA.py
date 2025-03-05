@@ -450,82 +450,38 @@ class LISAForCausalLM(nn.Module):
             input_text = "<|begin_of_chat|>\n<|user|>\n<|image|>\n" + prompt + "\n<|assistant|>"
             print(f"構築されたテキスト入力: {input_text}")
             
-            # 画像をPIL形式から変換
-            if isinstance(image, Image.Image):
-                # PIL画像をnumpy配列に変換
-                image_np = np.array(image)
-                # [H, W, C] -> [C, H, W]に変換
-                image_np = np.transpose(image_np, (2, 0, 1))
-                # バッチ次元を追加
-                image_np = np.expand_dims(image_np, axis=0)
-                # 画素値を0-255から0-1に正規化
-                image_np = image_np / 255.0
-                # numpyからTensorへ変換
-                image_tensor = torch.from_numpy(image_np).float()
-            else:
-                # 既にテンソルの場合は正規化のみ
-                if isinstance(image, torch.Tensor):
-                    image_tensor = image.float() / 255.0 if image.max() > 1.0 else image.float()
-                else:
-                    raise ValueError("imageはPIL.ImageまたはTorch.Tensorである必要があります")
-
-            # プロンプトをトークン化
-            tokenized_text = self.processor.tokenizer(input_text, return_tensors="pt")
-            
-            # DeepSpeed使用時はテンソルをCPUからGPUに移動しない（DeepSpeedが管理）
-            if not self.use_deepspeed:
-                image_tensor = image_tensor.to(device)
-                tokenized_text = {k: v.to(device) for k, v in tokenized_text.items()}
-            
-            # 入力辞書を作成
-            inputs = {
-                "input_ids": tokenized_text["input_ids"],
-                "attention_mask": tokenized_text["attention_mask"],
-                "pixel_values": image_tensor,
-                # アスペクト比IDとマスクはLlama 3.2 Vision仕様に合わせて計算（ここではダミー値）
-                "aspect_ratio_ids": torch.zeros_like(tokenized_text["input_ids"]),
-                "aspect_ratio_mask": torch.ones_like(tokenized_text["input_ids"]),
-            }
-            
-            # 入力テンソルの形状を表示
-            for key, tensor in inputs.items():
-                if isinstance(tensor, torch.Tensor):
-                    print(f"入力テンソル {key} の形状: {tensor.shape}")
-            
+            # プロセッサを使用してテキストと画像を一緒に処理
+            # プロセッサを使用して画像と入力テキストを処理
+            # 画像をプロセッサを使って正しい形式に変換
             try:
-                # DeepSpeed使用時の処理
-                if self.use_deepspeed:
-                    print("DeepSpeedを使用してテキスト生成を実行...")
-                    # DeepSpeedモデルでのgenerate呼び出し
-                    generate_ids = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        aspect_ratio_ids=inputs["aspect_ratio_ids"],
-                        aspect_ratio_mask=inputs["aspect_ratio_mask"],
-                        max_new_tokens=max_new_tokens,
-                        num_beams=num_beams,
-                        do_sample=do_sample,
-                        temperature=temperature,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                    )
+                # フルのプロセッサを使用して正しい形式にする
+                inputs = self.processor(
+                    image, 
+                    input_text, 
+                    return_tensors="pt",
+                    add_special_tokens=False
+                )
+                
+                print(f"プロセッサによる入力テンソルの形状:")
+                for key, tensor in inputs.items():
+                    if isinstance(tensor, torch.Tensor):
+                        print(f"{key}: {tensor.shape}")
+                
+                # DeepSpeed使用時は入力をモデルのデバイスに移動しない（DeepSpeedが管理）
+                if not self.use_deepspeed and device is not None:
+                    inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+                    print(f"入力テンソルをデバイス {device} に移動しました")
+                
+                try:
+                    # DeepSpeedまたは通常環境での生成
+                    if self.use_deepspeed:
+                        print("DeepSpeedを使用してテキスト生成を実行...")
+                    else:
+                        print(f"テキスト生成を実行...")
                     
-                    # トークンをデコード
-                    decoded_text = self.processor.tokenizer.batch_decode(
-                        generate_ids, skip_special_tokens=False
-                    )[0]
-                    
-                    return decoded_text
-                else:
-                    # 非DeepSpeed環境での処理（既存のコード）
-                    # generate メソッドを使用
+                    # 生成を実行
                     generate_ids = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        aspect_ratio_ids=inputs["aspect_ratio_ids"],
-                        aspect_ratio_mask=inputs["aspect_ratio_mask"],
+                        **inputs,
                         max_new_tokens=max_new_tokens,
                         num_beams=num_beams,
                         do_sample=do_sample,
@@ -541,11 +497,79 @@ class LISAForCausalLM(nn.Module):
                     
                     return decoded_text
 
+                except Exception as e:
+                    print(f"トークン生成中にエラーが発生しました: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return ""
+                
             except Exception as e:
-                print(f"トークン生成中にエラーが発生しました: {str(e)}")
+                print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                return ""
+                
+                # フォールバック: 旧方式で試行
+                print("フォールバック方法を試行中...")
+                
+                # プロンプトをトークン化
+                tokenized_text = self.processor.tokenizer(input_text, return_tensors="pt")
+                
+                # 画像をPIL形式から変換（ただしMllamaの形式に変換）
+                if isinstance(image, Image.Image):
+                    # PIL画像をプロセッサの画像プロセッサで処理
+                    pixel_values = self.processor.image_processor(image, return_tensors="pt").pixel_values
+                    
+                    # Llama 3.2 Vision要件に合わせてピクセル値の形状を変更
+                    # [batch_size, channels, height, width] -> [batch_size, 1, 1, channels, height, width]
+                    pixel_values = pixel_values.unsqueeze(1).unsqueeze(1)
+                    print(f"リシェイプ後のpixel_values形状: {pixel_values.shape}")
+                else:
+                    raise ValueError("imageはPIL.Imageである必要があります")
+                    
+                # DeepSpeed使用時はテンソルをCPUからGPUに移動しない（DeepSpeedが管理）
+                if not self.use_deepspeed and device is not None:
+                    pixel_values = pixel_values.to(device)
+                    tokenized_text = {k: v.to(device) for k, v in tokenized_text.items()}
+                
+                # 入力辞書を作成
+                inputs = {
+                    "input_ids": tokenized_text["input_ids"],
+                    "attention_mask": tokenized_text["attention_mask"],
+                    "pixel_values": pixel_values,
+                    # アスペクト比IDとマスクはLlama 3.2 Vision仕様に合わせて計算
+                    "aspect_ratio_ids": torch.zeros_like(tokenized_text["input_ids"]),
+                    "aspect_ratio_mask": torch.ones_like(tokenized_text["input_ids"]),
+                }
+                
+                # 入力テンソルの形状を表示
+                for key, tensor in inputs.items():
+                    if isinstance(tensor, torch.Tensor):
+                        print(f"入力テンソル {key} の形状: {tensor.shape}")
+                
+                try:
+                    # 生成を実行
+                    generate_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_beams=num_beams,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                    )
+                    
+                    # トークンをデコード
+                    decoded_text = self.processor.tokenizer.batch_decode(
+                        generate_ids, skip_special_tokens=False
+                    )[0]
+                    
+                    return decoded_text
+                    
+                except Exception as e:
+                    print(f"フォールバック生成中にエラーが発生しました: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return ""
 
         except Exception as e:
             print(f"segmentation生成中にエラーが発生しました: {e}")
