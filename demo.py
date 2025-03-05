@@ -301,7 +301,7 @@ def main(args):
             # セグメンテーション生成
             result = model.generate_segmentation(
                 image=image,
-                text_prompt=prompt,
+                prompt=prompt,
                 **generation_params
             )
             
