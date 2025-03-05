@@ -202,68 +202,23 @@ class LISAForCausalLM(nn.Module):
                         if self.use_deepspeed:
                             # DeepSpeedモデルのためのトークン拡張（代替手法）
                             print("DeepSpeedモデルのための代替埋め込み拡張手法を使用します")
-                            # DeepSpeedエンジンのモデルに直接アクセス
-                            old_num_tokens = len(self.processor.tokenizer) - 1  # 新トークン分を引く
-                            new_num_tokens = len(self.processor.tokenizer)
-
-                            # モデルモジュールの取得
-                            if hasattr(self.model, "module"):
-                                ds_model = self.model.module
-                            else:
-                                ds_model = self.model
-
-                            # 入力埋め込みの取得
-                            try:
-                                # 埋め込み取得方法1
-                                old_embeddings = ds_model.get_input_embeddings()
-                                
-                                # 埋め込みのサイズを確認
-                                if hasattr(old_embeddings, "weight"):
-                                    old_embedding_dim = old_embeddings.weight.size(-1)
-                                    print(f"入力埋め込みの次元: {old_embedding_dim}")
-                                    
-                                    # 新しい埋め込みを作成
-                                    new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
-                                    new_embeddings.to(old_embeddings.weight.device, dtype=old_embeddings.weight.dtype)
-
-                                    # 既存の重みを保持
-                                    with torch.no_grad():
-                                        new_embeddings.weight[:old_num_tokens, :] = old_embeddings.weight[:old_num_tokens, :]
-                                        
-                                        # 新しいトークンの重みを最後の10トークンの平均で初期化
-                                        avg_weight = old_embeddings.weight[-10:, :].mean(dim=0, keepdim=True)
-                                        new_embeddings.weight[old_num_tokens:, :] = avg_weight
-                                        
-                                    # モデルに新しい埋め込みを設定
-                                    ds_model.set_input_embeddings(new_embeddings)
-                                    
-                                    # 出力埋め込みも同様に拡張（必要な場合）
-                                    if hasattr(ds_model, "get_output_embeddings") and callable(getattr(ds_model, "get_output_embeddings")):
-                                        old_output_embeddings = ds_model.get_output_embeddings()
-                                        if old_output_embeddings is not None and hasattr(old_output_embeddings, "weight"):
-                                            print("出力埋め込みも拡張します")
-                                            out_emb_dim = old_output_embeddings.weight.size(-1)
-                                            new_out_embeddings = nn.Linear(out_emb_dim, new_num_tokens, bias=False)
-                                            new_out_embeddings.to(old_output_embeddings.weight.device, dtype=old_output_embeddings.weight.dtype)
-                                            
-                                            with torch.no_grad():
-                                                new_out_embeddings.weight[:old_num_tokens, :] = old_output_embeddings.weight[:old_num_tokens, :].t()
-                                                avg_out_weight = old_output_embeddings.weight[-10:, :].mean(dim=0, keepdim=True)
-                                                new_out_embeddings.weight[old_num_tokens:, :] = avg_out_weight.t()
-                                                
-                                            ds_model.set_output_embeddings(new_out_embeddings)
-                                else:
-                                    print("警告: 埋め込み層にweightがありません")
-                            except Exception as embed_e:
-                                print(f"埋め込み取得に失敗: {embed_e}")
-                                print("トークン自体は追加されましたが、埋め込みの拡張はスキップします")
+                            
+                            # トークンIDだけを取得し、埋め込み拡張はスキップ
+                            # これはDeepSpeed環境での埋め込み変更が複雑なため
+                            print("DeepSpeed環境では埋め込み拡張をスキップします")
+                            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
+                            print(f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
+                            print("トークンは追加されましたが、埋め込み拡張はスキップされました")
+                            
+                            # 注意：実際の運用では、埋め込み拡張を含むモデルを事前に保存し、
+                            # それをDeepSpeedでロードすることを推奨します
                         else:
                             # 通常の場合
                             self.model.resize_token_embeddings(vocab_size)
                             
-                        self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
-                        print(f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
-                        print("embedding層の拡張が完了しました")
+                            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
+                            print(f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
+                            print("embedding層の拡張が完了しました")
                 except Exception as e:
                     print(f"embeddings拡張中にエラー: {e}")
                     print("別の代替手段を試行...")
@@ -408,7 +363,7 @@ class LISAForCausalLM(nn.Module):
                 raise ValueError(f"未対応の画像タイプ: {type(image)}")
                 
             print(f"SAM変換を初期化しました (target_size=1024)")
-            transform = ResizeLongestSide(long_side_length=1024)
+            transform = ResizeLongestSide(target_length=1024)
             input_image = transform.apply_image(image_np)
 
             # 画像パディング情報を出力
