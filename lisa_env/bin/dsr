@@ -1,0 +1,6 @@
+#!/Users/odasoya/LISA-Llama-3/lisa_env/bin/python
+
+from deepspeed.env_report import cli_main
+
+if __name__ == '__main__':
+    cli_main()

@@ -1,0 +1,6 @@
+#!/Users/odasoya/LISA-Llama-3/lisa_env/bin/python
+
+from deepspeed.nvme import ds_io_main
+
+if __name__ == '__main__':
+    ds_io_main()

@@ -8,6 +8,7 @@ from PIL import Image
 import torch.nn.functional as F
 import os
 import time
+import deepspeed
 from transformers import AutoProcessor, AutoModelForCausalLM, AutoConfig, MllamaForConditionalGeneration
 from .segment_anything import sam_model_registry
 from .segment_anything.utils.transforms import ResizeLongestSide
@@ -25,7 +26,10 @@ class LISAForCausalLM(nn.Module):
         sam_checkpoint=None,
         seg_token="<seg>",
         device=None,
-        max_batch_size=1
+        max_batch_size=1,
+        use_deepspeed=False,
+        ds_config=None,
+        local_rank=-1
     ):
         """
         LISAモデルを初期化
@@ -36,9 +40,17 @@ class LISAForCausalLM(nn.Module):
             seg_token (str): セグメンテーショントークン
             device (str): 使用するデバイス ('cuda' または 'cpu')
             max_batch_size (int): 最大バッチサイズ
+            use_deepspeed (bool): DeepSpeedを使用するかどうか
+            ds_config (dict): DeepSpeedの設定
+            local_rank (int): 分散学習でのローカルランク（DeepSpeed用）
         """
         super().__init__()
 
+        # DeepSpeed関連の設定を保存
+        self.use_deepspeed = use_deepspeed
+        self.ds_config = ds_config
+        self.local_rank = local_rank
+        
         # デバイスを設定
         if device is None:
             # CUDAが利用可能な場合はそれを使用
@@ -56,6 +68,10 @@ class LISAForCausalLM(nn.Module):
                 self.device = "cpu"
         else:
             self.device = device
+        
+        # DeepSpeedを使用する場合、ローカルランクがマイナスでなければローカルランクを出力
+        if self.use_deepspeed and self.local_rank >= 0:
+            print(f"DeepSpeedを使用します。ローカルランク: {self.local_rank}")
         
         print(f"使用デバイス: {self.device}")
 
@@ -99,28 +115,61 @@ class LISAForCausalLM(nn.Module):
             print(f"プロセッサがロードされました: {self.processor.__class__.__name__}")
 
             # モデルをロード - Llama 3.2 Vision専用のクラスを使用
-            # MPSエラーを回避するために、より安全な方法でデバイスを指定
-            device_param = "auto" if self.device is None else self.device
+            # DeepSpeed使用時と非使用時で分岐
+            if self.use_deepspeed:
+                # DeepSpeedを使用する場合の設定
+                print("DeepSpeedを使用してモデルをロードします")
+                
+                # デバイスマップは使用しない（DeepSpeedが管理するため）
+                load_params = {
+                    "torch_dtype": self.dtype,
+                    "trust_remote_code": True
+                }
+                
+                # モデルをロード
+                model = MllamaForConditionalGeneration.from_pretrained(
+                    model_path,
+                    **load_params
+                )
+                
+                # DeepSpeedエンジンを初期化
+                ds_engine_params = {
+                    "model": model,
+                    "config_params": self.ds_config,
+                }
+                
+                # ローカルランクが指定されている場合は追加
+                if self.local_rank >= 0:
+                    ds_engine_params["config_params"]["local_rank"] = self.local_rank
+                
+                # DeepSpeedエンジンを初期化
+                self.model, _, _, _ = deepspeed.initialize(**ds_engine_params)
+                
+                print("DeepSpeedエンジンが初期化されました")
+            else:
+                # 通常のロード（DeepSpeedなし）
+                device_param = "auto" if self.device is None else self.device
+                
+                # トーチ2.0以降でのMPSサポートチェック
+                load_params = {
+                    "torch_dtype": self.dtype,
+                    "trust_remote_code": True
+                }
+                
+                # MPSまたはCUDAサポートチェック
+                if device_param != "cpu":
+                    try:
+                        load_params["device_map"] = device_param
+                    except Exception as e:
+                        print(f"デバイスマップの設定中にエラー: {e}")
+                        print("CPUにフォールバックします")
+                        device_param = "cpu"
+                
+                self.model = MllamaForConditionalGeneration.from_pretrained(
+                    model_path,
+                    **load_params
+                )
             
-            # トーチ2.0以降でのMPSサポートチェック
-            load_params = {
-                "torch_dtype": self.dtype,
-                "trust_remote_code": True
-            }
-            
-            # MPSまたはCUDAサポートチェック
-            if device_param != "cpu":
-                try:
-                    load_params["device_map"] = device_param
-                except Exception as e:
-                    print(f"デバイスマップの設定中にエラー: {e}")
-                    print("CPUにフォールバックします")
-                    device_param = "cpu"
-            
-            self.model = MllamaForConditionalGeneration.from_pretrained(
-                model_path,
-                **load_params
-            )
             self.model.eval()
             print(f"モデルがロードされました: {self.model.__class__.__name__}")
 
@@ -149,8 +198,15 @@ class LISAForCausalLM(nn.Module):
                         # トークンインデックスだけ取得（そしてハンドリング時に特別処理）
                         print("CPUではembedding層の拡張をスキップします")
                     else:
-                        # GPUの場合は通常通り拡張
-                        self.model.resize_token_embeddings(vocab_size)
+                        # DeepSpeed使用時は特別な処理が必要
+                        if self.use_deepspeed:
+                            # DeepSpeedエンジンのモデルに直接アクセス
+                            ds_model = self.model.module
+                            ds_model.resize_token_embeddings(vocab_size)
+                        else:
+                            # 通常の場合
+                            self.model.resize_token_embeddings(vocab_size)
+                            
                         self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
                         print(f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
                         print("embedding層の拡張が完了しました")
@@ -158,7 +214,11 @@ class LISAForCausalLM(nn.Module):
                     print(f"embeddings拡張中にエラー: {e}")
                     print("代替手段を試行...")
                     # 既存の重みを保持して拡張する代替手法
-                    old_embeddings = self.model.get_input_embeddings()
+                    if self.use_deepspeed:
+                        old_embeddings = self.model.module.get_input_embeddings()
+                    else:
+                        old_embeddings = self.model.get_input_embeddings()
+                        
                     old_num_tokens = old_embeddings.weight.size(0)
                     new_num_tokens = len(self.processor.tokenizer)
 
@@ -181,7 +241,11 @@ class LISAForCausalLM(nn.Module):
                                                   :] = avg_weight
 
                         # 新しいembeddingに置き換え
-                        self.model.set_input_embeddings(new_embeddings)
+                        if self.use_deepspeed:
+                            self.model.module.set_input_embeddings(new_embeddings)
+                        else:
+                            self.model.set_input_embeddings(new_embeddings)
+                            
                         print("代替手法によるembedding拡張が完了しました")
 
             # セグメンテーショントークンのインデックスを取得
@@ -325,18 +389,22 @@ class LISAForCausalLM(nn.Module):
         generation_params: dict - generate関数に渡す追加パラメータ
         """
         try:
-            # ここで明示的にデバイスをCPUに設定
-            device = torch.device("cpu")
-            self.device = device
-            print(f"デバイス: {self.device}")
+            # DeepSpeed使用時はデバイス設定をスキップ（既にDeepSpeedが管理）
+            if not self.use_deepspeed:
+                # ここで明示的にデバイスをCPUに設定
+                device = torch.device("cpu")
+                self.device = device
+                print(f"デバイス: {self.device}")
 
-            # デバイスの一貫性を確保
-            if hasattr(self, 'model'):
-                self.model.to(device)
-            if hasattr(self, 'sam'):
-                self.sam.to(device)
-            if hasattr(self, 'seg_projection'):
-                self.seg_projection.to(device)
+                # デバイスの一貫性を確保
+                if hasattr(self, 'model'):
+                    self.model.to(device)
+                if hasattr(self, 'sam'):
+                    self.sam.to(device)
+                if hasattr(self, 'seg_projection'):
+                    self.seg_projection.to(device)
+            else:
+                print("DeepSpeed使用中: デバイス設定はスキップされます")
 
             # 生成パラメータ（デフォルト値を設定）
             temperature = kwargs.get('temperature', 0.2)
@@ -390,10 +458,12 @@ class LISAForCausalLM(nn.Module):
                 if isinstance(tensor, torch.Tensor):
                     print(f"入力テンソル {key} の形状: {tensor.shape}")
 
-            # デバイスに送る
-            inputs = {k: v.to(self.device) if isinstance(
-                v, torch.Tensor) else v for k, v in inputs.items()}
-
+            # DeepSpeed使用時はデバイス移動をスキップ（既にDeepSpeedが管理）
+            if not self.use_deepspeed:
+                # デバイスに送る
+                inputs = {k: v.to(self.device) if isinstance(
+                    v, torch.Tensor) else v for k, v in inputs.items()}
+            
             # モデルのフォワードパスを実行して過去の状態を取得
             print("モデルのフォワードパスを実行して過去の状態を取得...")
             print(f"モデル入力のキー: {inputs.keys()}")
@@ -403,49 +473,75 @@ class LISAForCausalLM(nn.Module):
                         f"モデル入力 {key} の形状: {value.shape}, デバイス: {value.device}")
 
             try:
-                # generate メソッドの代わりに手動でデコードを行う
-                outputs = self.model(**inputs)
-                logits = outputs.logits
+                # DeepSpeed使用時の処理
+                if self.use_deepspeed:
+                    print("DeepSpeedを使用してテキスト生成を実行...")
+                    # DeepSpeedモデルでのgenerate呼び出し
+                    generate_ids = self.model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"],
+                        aspect_ratio_ids=inputs["aspect_ratio_ids"],
+                        aspect_ratio_mask=inputs["aspect_ratio_mask"],
+                        max_new_tokens=max_new_tokens,
+                        num_beams=num_beams,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                    )
+                    
+                    # トークンをデコード
+                    decoded_text = self.processor.tokenizer.batch_decode(
+                        generate_ids, skip_special_tokens=False
+                    )[0]
+                    
+                    return decoded_text
+                else:
+                    # 非DeepSpeed環境での処理（既存のコード）
+                    # generate メソッドの代わりに手動でデコードを行う
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
 
-                # 簡易的に次のトークンを生成
-                next_token_logits = logits[:, -1, :]
-                next_token = torch.argmax(next_token_logits, dim=-1)
-
-                # シンプルな実装：手動でトークンを生成
-                generated_ids = inputs["input_ids"]
-                max_new_tokens = kwargs.get("max_new_tokens", 30)
-
-                for _ in range(max_new_tokens):
-                    current_inputs = {
-                        "input_ids": generated_ids,
-                        "attention_mask": torch.ones_like(generated_ids),
-                    }
-
-                    # 画像情報は最初の入力と同じものを使用
-                    for k in inputs:
-                        if k not in current_inputs and k != "input_ids" and k != "attention_mask":
-                            current_inputs[k] = inputs[k]
-
-                    outputs = self.model(**current_inputs)
-                    next_token_logits = outputs.logits[:, -1, :]
+                    # 簡易的に次のトークンを生成
+                    next_token_logits = logits[:, -1, :]
                     next_token = torch.argmax(next_token_logits, dim=-1)
 
-                    # 終了トークンをチェック
-                    if next_token.item() in self.processor.tokenizer.eos_token_id:
-                        break
+                    # シンプルな実装：手動でトークンを生成
+                    generated_ids = inputs["input_ids"]
+                    max_new_tokens = kwargs.get("max_new_tokens", 30)
 
-                    generated_ids = torch.cat(
-                        [generated_ids, next_token.unsqueeze(0)], dim=1)
+                    for _ in range(max_new_tokens):
+                        current_inputs = {
+                            "input_ids": generated_ids,
+                            "attention_mask": torch.ones_like(generated_ids),
+                        }
 
-                    # セグメンテーショントークンをチェック
-                    if next_token.item() == self.seg_token_idx:
-                        # セグメンテーション処理
-                        # 実装は略...
-                        pass
+                        # 画像情報は最初の入力と同じものを使用
+                        for k in inputs:
+                            if k not in current_inputs and k != "input_ids" and k != "attention_mask":
+                                current_inputs[k] = inputs[k]
 
-                decoded_text = self.processor.tokenizer.decode(
-                    generated_ids[0], skip_special_tokens=False)
-                return decoded_text
+                        outputs = self.model(**current_inputs)
+                        next_token_logits = outputs.logits[:, -1, :]
+                        next_token = torch.argmax(next_token_logits, dim=-1)
+
+                        # 終了トークンをチェック
+                        if next_token.item() in self.processor.tokenizer.eos_token_id:
+                            break
+
+                        generated_ids = torch.cat(
+                            [generated_ids, next_token.unsqueeze(0)], dim=1)
+
+                        # セグメンテーショントークンをチェック
+                        if next_token.item() == self.seg_token_idx:
+                            # セグメンテーション処理
+                            # 実装は略...
+                            pass
+
+                    decoded_text = self.processor.tokenizer.decode(
+                        generated_ids[0], skip_special_tokens=False)
+                    return decoded_text
 
             except Exception as e:
                 print(f"トークン生成中にエラーが発生しました: {str(e)}")
@@ -460,13 +556,24 @@ class LISAForCausalLM(nn.Module):
             return {"masks": [], "text": f"エラー: {str(e)}"}
 
     @classmethod
-    def from_pretrained(cls, model_path, sam_checkpoint=None, **kwargs):
+    def from_pretrained(cls, model_path, sam_checkpoint=None, use_deepspeed=False, ds_config=None, local_rank=-1, **kwargs):
         """
         事前学習済みモデルからLISAモデルを作成
+        
+        Args:
+            model_path: モデルのパス
+            sam_checkpoint: SAMチェックポイントのパス
+            use_deepspeed: DeepSpeedを使用するかどうか
+            ds_config: DeepSpeedの設定
+            local_rank: ローカルランク（DeepSpeed用）
+            **kwargs: その他の引数
         """
         return cls(
             model_path=model_path,
             sam_checkpoint=sam_checkpoint,
+            use_deepspeed=use_deepspeed,
+            ds_config=ds_config,
+            local_rank=local_rank,
             **kwargs
         )
 

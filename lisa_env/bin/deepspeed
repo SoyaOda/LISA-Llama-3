@@ -1,0 +1,6 @@
+#!/Users/odasoya/LISA-Llama-3/lisa_env/bin/python
+
+from deepspeed.launcher.runner import main
+
+if __name__ == '__main__':
+    main()
