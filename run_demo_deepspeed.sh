@@ -22,8 +22,14 @@ MODEL_PATH="meta-llama/Llama-3.2-11B-Vision-Instruct"
 
 # SAMチェックポイント（設定されている場合）
 SAM_CHECKPOINT=""
+# 複数の場所をチェック
 if [ -f "sam_vit_h_4b8939.pth" ]; then
     SAM_CHECKPOINT="sam_vit_h_4b8939.pth"
+elif [ -f "checkpoints/sam_vit_h_4b8939.pth" ]; then
+    SAM_CHECKPOINT="checkpoints/sam_vit_h_4b8939.pth"
+fi
+
+if [ ! -z "$SAM_CHECKPOINT" ]; then
     echo "SAMチェックポイントを使用: $SAM_CHECKPOINT"
 fi
 
@@ -45,11 +51,17 @@ NPROC=$(( NUM_GPUS > 8 ? 8 : NUM_GPUS ))
 
 echo "DeepSpeedを使用して${NPROC}台のGPUで実行します..."
 
+# SAMチェックポイントオプションの準備
+SAM_OPTS=""
+if [ ! -z "$SAM_CHECKPOINT" ]; then
+    SAM_OPTS="--sam_checkpoint $SAM_CHECKPOINT"
+fi
+
 # メインのコマンド実行
 # nproc_per_nodeでGPUの数を指定し、deepspeedコマンドでマルチGPU実行
 deepspeed --num_gpus=$NPROC demo.py \
     --model_path $MODEL_PATH \
-    --sam_checkpoint $SAM_CHECKPOINT \
+    $SAM_OPTS \
     --image_path $IMAGE_PATH \
     --prompt "$PROMPT" \
     --output_dir $OUTPUT_DIR \
