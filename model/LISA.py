@@ -449,8 +449,10 @@ class LISAForCausalLM(nn.Module):
 
             # チャットメッセージを作成
             messages = [
-                {"type": "text", "text": prompt},
-                {"type": "image"}
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image"}
+                ]}
             ]
 
             # LLMへの入力テキストを作成
