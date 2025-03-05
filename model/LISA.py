@@ -436,6 +436,23 @@ class LISAForCausalLM(nn.Module):
         # マスクのリストを初期化
         masks = []
 
+        def check_image(img):
+            """画像が正しい形式かチェックし、必要なら変換する"""
+            from PIL import Image
+            import numpy as np
+            
+            if isinstance(img, str):
+                # 画像パスの場合はロード
+                return Image.open(img).convert('RGB')
+            elif isinstance(img, np.ndarray):
+                # NumPy配列の場合はPILに変換
+                return Image.fromarray(img).convert('RGB')
+            elif isinstance(img, Image.Image):
+                # すでにPIL画像の場合はそのまま返す
+                return img.convert('RGB')
+            else:
+                raise ValueError(f"非対応の画像形式: {type(img)}")
+
         try:
             # モデルのデバイスを取得（DeepSpeed使用時も同様）
             model_device = next(self.model.parameters()).device
@@ -446,59 +463,101 @@ class LISAForCausalLM(nn.Module):
             sam_image_embedding = self.preprocess_sam_image(image)
             print(f"SAM画像埋め込み: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}")
 
-            # Llama 3.2 Visionの正しいメッセージ形式を使用
-            # 注意: typeの順序が重要 - imageを先に指定
+            # 画像が正しい形式かチェック
+            pil_image = check_image(image)
+            
+            # Llama 3.2 Visionのメッセージ形式
             messages = [
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt}
-                ]}
+                {
+                    "role": "user", 
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
             ]
-
+            
             print(f"メッセージ構造: {messages}")
-
-            # LLMへの入力テキストを作成
+            
+            # チャットテンプレートの適用
             input_text = self.processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 return_tensors=None
             )
+            
             print(f"入力テキスト: {input_text}")
-
+            
             try:
-                # 画像とテキストを同時に処理
-                print("画像とテキストを一度に処理します...")
+                # 画像とテキストを一度に処理してモデル入力を作成
+                print("画像とテキストを処理します...")
                 model_inputs = self.processor(
-                    images=image,  
+                    images=pil_image,
                     text=input_text,
                     return_tensors="pt"
                 )
                 
-                # 各テンソルをモデルのデバイスに移動
+                # デバッグ用に処理前の形状を出力
+                for k, v in model_inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"処理後の {k}: 形状={v.shape}, デバイス={v.device}, 型={v.dtype}")
+                
+                # すべての入力テンソルをモデルのデバイスに移動
                 for k, v in model_inputs.items():
                     if isinstance(v, torch.Tensor):
                         model_inputs[k] = v.to(model_device)
                 
-                # デバッグ用に形状とデバイスを表示
+                # aspect_ratio_idsが正しくないか欠けている場合に対応
+                if 'aspect_ratio_ids' not in model_inputs or model_inputs['aspect_ratio_ids'].shape[-1] != model_inputs['pixel_values'].shape[1]:
+                    print("aspect_ratio_idsを作成します")
+                    model_inputs['aspect_ratio_ids'] = torch.zeros(
+                        (model_inputs['pixel_values'].shape[0], model_inputs['pixel_values'].shape[1]),
+                        dtype=torch.long, device=model_device
+                    )
+                
+                # aspect_ratio_maskが正しくないか欠けている場合に対応 
+                if 'aspect_ratio_mask' not in model_inputs:
+                    print("aspect_ratio_maskを作成します")
+                    # 典型的にはpixel_valuesの最後から2次元目のサイズに合わせる
+                    if len(model_inputs['pixel_values'].shape) >= 5:
+                        num_patches = model_inputs['pixel_values'].shape[-3]  # 通常のパッチ数
+                        model_inputs['aspect_ratio_mask'] = torch.ones(
+                            (model_inputs['pixel_values'].shape[0], 1, num_patches),
+                            dtype=torch.long, device=model_device
+                        )
+                
+                # pixel_valuesの形状を確認し、必要なら修正
+                if len(model_inputs['pixel_values'].shape) > 5:
+                    # 次元が多すぎる場合、reshape
+                    print(f"pixel_valuesの形状を修正します: {model_inputs['pixel_values'].shape}")
+                    pixel_shape = model_inputs['pixel_values'].shape
+                    if len(pixel_shape) == 6:  # [B, 1, P, C, H, W]
+                        # [B, P, C, H, W]の形式に変更
+                        model_inputs['pixel_values'] = model_inputs['pixel_values'].squeeze(1)
+                        print(f"修正後のpixel_values形状: {model_inputs['pixel_values'].shape}")
+                
+                # 入力テンソルの形状とデバイスを確認
                 for k, v in model_inputs.items():
-                    if hasattr(v, 'shape'):
-                        print(f"入力 {k}: 形状={v.shape}, デバイス={v.device}")
-                    else:
-                        print(f"入力 {k}: 型={type(v)}")
-
-                # テキスト生成（DeepSpeedと通常環境の両方に対応）
+                    if isinstance(v, torch.Tensor):
+                        print(f"モデル入力 {k}: 形状={v.shape}, デバイス={v.device}")
+                
+                # テキスト生成
                 try:
                     # DeepSpeed環境の場合
                     if hasattr(self.model, 'module') and hasattr(self.model.module, 'generate'):
                         print("DeepSpeed環境でgenerateを実行します")
                         try:
                             generate_outputs = self.model.module.generate(
-                                **model_inputs,
+                                input_ids=model_inputs['input_ids'],
+                                attention_mask=model_inputs['attention_mask'],
+                                pixel_values=model_inputs['pixel_values'],
+                                aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
+                                aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
                                 top_p=top_p,
-                                top_k=top_k,
+                                top_k=50 if top_k is None else top_k,
                                 num_beams=num_beams,
                                 repetition_penalty=repetition_penalty,
                                 output_hidden_states=True,
@@ -509,12 +568,16 @@ class LISAForCausalLM(nn.Module):
                             # フォールバック: 非DeepSpeed方式で試す
                             print("フォールバック: 非DeepSpeed方式でgenerateを実行します")
                             generate_outputs = self.model.generate(
-                                **model_inputs,
+                                input_ids=model_inputs['input_ids'],
+                                attention_mask=model_inputs['attention_mask'],
+                                pixel_values=model_inputs['pixel_values'],
+                                aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
+                                aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
                                 top_p=top_p,
-                                top_k=top_k,
+                                top_k=50 if top_k is None else top_k,
                                 num_beams=num_beams,
                                 repetition_penalty=repetition_penalty,
                                 output_hidden_states=True,
@@ -524,12 +587,16 @@ class LISAForCausalLM(nn.Module):
                         # 通常のgenerateメソッド
                         print("通常環境でgenerateを実行します")
                         generate_outputs = self.model.generate(
-                            **model_inputs,
+                            input_ids=model_inputs['input_ids'],
+                            attention_mask=model_inputs['attention_mask'],
+                            pixel_values=model_inputs['pixel_values'],
+                            aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
+                            aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
                             max_new_tokens=max_new_tokens,
                             do_sample=do_sample,
                             temperature=temperature,
                             top_p=top_p,
-                            top_k=top_k,
+                            top_k=50 if top_k is None else top_k,
                             num_beams=num_beams,
                             repetition_penalty=repetition_penalty,
                             output_hidden_states=True,
@@ -573,8 +640,8 @@ class LISAForCausalLM(nn.Module):
                                     input_ids=input_ids_segment,
                                     attention_mask=attention_mask_segment,
                                     pixel_values=model_inputs['pixel_values'],
-                                    aspect_ratio_ids=model_inputs['aspect_ratio_ids'],
-                                    aspect_ratio_mask=model_inputs['aspect_ratio_mask'],
+                                    aspect_ratio_ids=model_inputs['aspect_ratio_ids'] if 'aspect_ratio_ids' in model_inputs else None,
+                                    aspect_ratio_mask=model_inputs['aspect_ratio_mask'] if 'aspect_ratio_mask' in model_inputs else None,
                                     output_hidden_states=True,
                                     return_dict=True
                                 )
