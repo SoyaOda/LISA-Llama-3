@@ -442,91 +442,58 @@ class LISAForCausalLM(nn.Module):
             print(f"モデルのデバイス: {model_device}")
 
             # SAMモデルの画像エンコーダを使用して画像埋め込みを取得
-            # 既存の preprocess_sam_image メソッドを使用
-            image_embedding = self.preprocess_sam_image(image)
-            print(
-                f"SAM画像埋め込み: 形状={image_embedding.shape}, デバイス={image_embedding.device}")
+            # SAM用の画像埋め込みを事前に計算
+            sam_image_embedding = self.preprocess_sam_image(image)
+            print(f"SAM画像埋め込み: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}")
 
-            # チャットメッセージを作成
+            # Llama 3.2 Visionの正しいメッセージ形式を使用
+            # 注意: typeの順序が重要 - imageを先に指定
             messages = [
                 {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image"}
+                    {"type": "image"},
+                    {"type": "text", "text": prompt}
                 ]}
             ]
+
+            print(f"メッセージ構造: {messages}")
 
             # LLMへの入力テキストを作成
             input_text = self.processor.apply_chat_template(
                 messages,
-                tokenize=False,
-                add_generation_prompt=True
+                add_generation_prompt=True,
+                return_tensors=None
             )
             print(f"入力テキスト: {input_text}")
 
             try:
-                # 画像とテキストを同時に処理（Llama 3.2 Visionでの正しい使用方法）
-                print("画像とテキストを同時に処理します...")
-                inputs = self.processor(
-                    images=image,  # PIL画像または適切な形式の画像
+                # 画像とテキストを同時に処理
+                print("画像とテキストを一度に処理します...")
+                model_inputs = self.processor(
+                    images=image,  
                     text=input_text,
                     return_tensors="pt"
                 )
                 
                 # 各テンソルをモデルのデバイスに移動
-                for k, v in inputs.items():
-                    inputs[k] = v.to(self.device)
+                for k, v in model_inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        model_inputs[k] = v.to(model_device)
                 
                 # デバッグ用に形状とデバイスを表示
-                for k, v in inputs.items():
+                for k, v in model_inputs.items():
                     if hasattr(v, 'shape'):
                         print(f"入力 {k}: 形状={v.shape}, デバイス={v.device}")
                     else:
                         print(f"入力 {k}: 型={type(v)}")
-                
-                # aspect_ratio_ids と aspect_ratio_mask を確認
-                # これらがプロセッサから返されない場合は作成する
-                if 'aspect_ratio_ids' not in inputs:
-                    print("aspect_ratio_idsが見つかりません。作成します...")
-                    # 入力IDsと同じサイズの0埋めtensorを作成
-                    inputs['aspect_ratio_ids'] = torch.zeros_like(inputs['input_ids'])
-                    inputs['aspect_ratio_mask'] = torch.ones_like(inputs['input_ids'])
 
-                # クロスアテンションマスクの作成（必要な場合）
-                model_device = next(self.model.parameters()).device
-                if 'cross_attention_mask' in inputs:
-                    # 辞書アクセスに変更（属性アクセスではなく）
-                    cross_attention_mask = inputs['cross_attention_mask'].to(model_device)
-                    modified_inputs = {
-                        "input_ids": inputs['input_ids'],
-                        "attention_mask": inputs['attention_mask'],
-                        "pixel_values": inputs['pixel_values'],
-                        "aspect_ratio_ids": inputs['aspect_ratio_ids'],
-                        "aspect_ratio_mask": inputs['aspect_ratio_mask'],
-                        "cross_attention_mask": cross_attention_mask
-                    }
-                else:
-                    modified_inputs = {
-                        "input_ids": inputs['input_ids'],
-                        "attention_mask": inputs['attention_mask'],
-                        "pixel_values": inputs['pixel_values'],
-                        "aspect_ratio_ids": inputs['aspect_ratio_ids'],
-                        "aspect_ratio_mask": inputs['aspect_ratio_mask']
-                    }
-
-                print(f"入力形状: input_ids={modified_inputs['input_ids'].shape}, attention_mask={modified_inputs['attention_mask'].shape}, "
-                      f"pixel_values={modified_inputs['pixel_values'].shape}, aspect_ratio_ids={modified_inputs['aspect_ratio_ids'].shape}, "
-                      f"aspect_ratio_mask={modified_inputs['aspect_ratio_mask'].shape}")
-                print(f"入力デバイス: input_ids={modified_inputs['input_ids'].device}, attention_mask={modified_inputs['attention_mask'].device}, "
-                      f"pixel_values={modified_inputs['pixel_values'].device}, aspect_ratio_ids={modified_inputs['aspect_ratio_ids'].device}, "
-                      f"aspect_ratio_mask={modified_inputs['aspect_ratio_mask'].device}")
-
+                # テキスト生成（DeepSpeedと通常環境の両方に対応）
                 try:
-                    # deepspeedを使用している場合の処理
+                    # DeepSpeed環境の場合
                     if hasattr(self.model, 'module') and hasattr(self.model.module, 'generate'):
                         print("DeepSpeed環境でgenerateを実行します")
                         try:
                             generate_outputs = self.model.module.generate(
-                                **modified_inputs,
+                                **model_inputs,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
@@ -538,13 +505,11 @@ class LISAForCausalLM(nn.Module):
                                 return_dict_in_generate=True
                             )
                         except Exception as deepspeed_error:
-                            print(
-                                f"DeepSpeed generate中にエラーが発生しました: {deepspeed_error}")
-
+                            print(f"DeepSpeed generate中にエラーが発生しました: {deepspeed_error}")
                             # フォールバック: 非DeepSpeed方式で試す
                             print("フォールバック: 非DeepSpeed方式でgenerateを実行します")
                             generate_outputs = self.model.generate(
-                                **modified_inputs,
+                                **model_inputs,
                                 max_new_tokens=max_new_tokens,
                                 do_sample=do_sample,
                                 temperature=temperature,
@@ -559,7 +524,7 @@ class LISAForCausalLM(nn.Module):
                         # 通常のgenerateメソッド
                         print("通常環境でgenerateを実行します")
                         generate_outputs = self.model.generate(
-                            **modified_inputs,
+                            **model_inputs,
                             max_new_tokens=max_new_tokens,
                             do_sample=do_sample,
                             temperature=temperature,
@@ -573,227 +538,106 @@ class LISAForCausalLM(nn.Module):
 
                     # 生成されたトークンIDを取得
                     generate_ids = generate_outputs.sequences
-
+                    
                     # トークンをデコード
                     decoded_text = self.processor.tokenizer.batch_decode(
                         generate_ids, skip_special_tokens=False
                     )[0]
+                    
                     print(f"生成された生のテキスト: {decoded_text}")
 
-                    # SAMを使ってセグメンテーションマスクを生成
-                    # 1. <seg>トークンの位置を検索
+                    # <seg>トークンの検出と処理
                     seg_token_id = self.processor.tokenizer.convert_tokens_to_ids(
                         self.seg_token)
                     print(f"<seg>トークンID: {seg_token_id}")
 
                     # 生成されたトークンから<seg>トークンの位置を見つける
-                    # マスクを作成してトークンを検出する方法（オリジナルLISAの方法）
-                    seg_token_mask = (generate_ids == seg_token_id)
-                    print(f"セグメンテーショントークンマスク形状: {seg_token_mask.shape}")
+                    seg_positions = []
+                    for batch_idx in range(generate_ids.shape[0]):
+                        positions = torch.where(generate_ids[batch_idx] == seg_token_id)[0]
+                        for pos in positions:
+                            seg_positions.append((batch_idx, pos.item()))
+                    
+                    print(f"<seg>トークン位置: {seg_positions}")
 
-                    # デバッグ情報：マスクで見つかった<seg>トークンの数
-                    seg_token_count = seg_token_mask.sum().item()
-                    print(f"<seg>トークンが見つかりました: {seg_token_count}個")
-
-                    if seg_token_count > 0:
-                        print(
-                            f"{seg_token_count}個の<seg>トークンについてセグメンテーションマスクを生成します")
-
-                        # 隠れ状態を得る方法を変更
-                        # 注：generate_outputs.hidden_statesは生成過程全体ではなく、最後のステップの隠れ状態のみ
-                        # ここでのアプローチ：もう一度フォワードパスを実行して全シーケンスの隠れ状態を取得
+                    # 各<seg>トークンについてマスクを生成
+                    for batch_idx, pos in seg_positions:
                         try:
-                            print("生成されたシーケンス全体の隠れ状態を取得するためにフォワードパスを実行します")
+                            # この位置までのシーケンスを抽出
+                            input_ids_segment = generate_ids[batch_idx, :pos+1].unsqueeze(0)
+                            attention_mask_segment = torch.ones_like(input_ids_segment)
+
+                            # フォワードパスを実行して隠れ状態を取得
                             with torch.no_grad():
-                                # 生成されたシーケンス全体を入力として使用
-                                forward_inputs = {
-                                    "input_ids": generate_ids,
-                                    "attention_mask": torch.ones_like(generate_ids),
-                                    "pixel_values": image_embedding,
-                                    "aspect_ratio_ids": torch.zeros_like(generate_ids).to(model_device),
-                                    "aspect_ratio_mask": torch.ones_like(generate_ids).to(model_device),
-                                    "output_hidden_states": True,
-                                    "return_dict": True
-                                }
+                                outputs = self.model(
+                                    input_ids=input_ids_segment,
+                                    attention_mask=attention_mask_segment,
+                                    pixel_values=model_inputs['pixel_values'],
+                                    aspect_ratio_ids=model_inputs['aspect_ratio_ids'],
+                                    aspect_ratio_mask=model_inputs['aspect_ratio_mask'],
+                                    output_hidden_states=True,
+                                    return_dict=True
+                                )
 
-                                # モデルを通して全シーケンスの隠れ状態を取得
-                                outputs = self.model(**forward_inputs)
-
-                                # 最終層の隠れ状態を取得
-                                last_hidden_state = outputs.hidden_states[-1]
-                                print(
-                                    f"全シーケンスの隠れ状態形状: {last_hidden_state.shape}")
-
-                                # <seg>トークンに対応する隠れ状態を抽出
-                                # 注：seg_token_maskとlast_hidden_stateのサイズが一致している必要がある
-                                if seg_token_mask.shape[1] != last_hidden_state.shape[1]:
-                                    print(
-                                        f"警告: トークンマスク長 ({seg_token_mask.shape[1]}) と 隠れ状態長 ({last_hidden_state.shape[1]}) が一致しません")
-                                    # サイズが異なる場合は調整（短い方に合わせる）
-                                    min_length = min(
-                                        seg_token_mask.shape[1], last_hidden_state.shape[1])
-                                    seg_token_mask = seg_token_mask[:,
-                                                                    :min_length]
-                                    last_hidden_state = last_hidden_state[:,
-                                                                          :min_length]
-
-                                # <seg>トークンに対応する隠れ状態のみを抽出
-                                pred_embeddings = last_hidden_state[seg_token_mask]
-                                print(
-                                    f"抽出された<seg>トークン埋め込み形状: {pred_embeddings.shape}")
-
-                                # 各<seg>トークンについて処理
-                                for i in range(pred_embeddings.shape[0]):
-                                    # 埋め込みベクトルを取得
-                                    hidden_states = pred_embeddings[i]
-
-                                    # 隠れ状態をSAMの次元（256次元）に投影
-                                    with torch.no_grad():
-                                        # 投影レイヤーを使って256次元に変換
-                                        point_embedding = self.seg_projection(
-                                            hidden_states)
-
-                                        # デバイス確認と移動
-                                        sam_device = next(
-                                            self.sam.parameters()).device
-                                        point_embedding = point_embedding.to(
-                                            sam_device)
-
-                                        print(
-                                            f"SAMプロンプト埋め込み: 形状={point_embedding.shape}, デバイス={point_embedding.device}")
-
-                                        # イメージ埋め込みの形状を確認
-                                        print(
-                                            f"画像埋め込み: 形状={image_embedding.shape}, デバイス={image_embedding.device}")
-
-                                        # SAMデコーダを実行してマスクを生成
-                                        # point_embedはスパース埋め込みとして使用
-                                        sparse_embeddings = point_embedding.unsqueeze(
-                                            0)  # [1, 256]
-
-                                        # SAMデコーダに入力
-                                        mask_predictions, _ = self.sam.mask_decoder(
-                                            image_embeddings=image_embedding,
-                                            image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                                            sparse_prompt_embeddings=sparse_embeddings,
-                                            dense_prompt_embeddings=None,
-                                            multimask_output=False,  # 単一マスク出力
-                                        )
-
-                                        # マスク予測を取得
-                                        # [1, 1, H, W]
-                                        mask_pred = mask_predictions[0]
-                                        print(f"マスク予測: 形状={mask_pred.shape}")
-
-                                        # シグモイド関数を適用して[0, 1]の範囲にする
-                                        mask_pred = torch.sigmoid(mask_pred)
-
-                                        # 閾値を適用してバイナリマスクに変換
-                                        mask_binary = (mask_pred > 0.5).float()
-
-                                        # 予測されたマスクをCPUに移動してリストに追加
-                                        mask_np = mask_binary[0, 0].cpu(
-                                        ).numpy()
-                                        masks.append(mask_np)
-
-                                        print(
-                                            f"マスク {len(masks)} を生成しました: 形状={mask_np.shape}")
-
+                                # 最後の位置（<seg>トークン）の隠れ状態を取得
+                                hidden_states = outputs.hidden_states[-1][0, -1]
+                                
+                                # 隠れ状態をSAMの次元（256次元）に投影
+                                point_embedding = self.seg_projection(hidden_states)
+                                sam_device = next(self.sam.parameters()).device
+                                point_embedding = point_embedding.to(sam_device)
+                                
+                                print(f"SAMプロンプト埋め込み: 形状={point_embedding.shape}, デバイス={point_embedding.device}")
+                                
+                                # SAMデコーダを実行してマスクを生成
+                                sparse_embeddings = point_embedding.unsqueeze(0)
+                                mask_predictions, _ = self.sam.mask_decoder(
+                                    image_embeddings=sam_image_embedding.to(sam_device),
+                                    image_pe=self.sam.prompt_encoder.get_dense_pe(),
+                                    sparse_prompt_embeddings=sparse_embeddings,
+                                    dense_prompt_embeddings=None,
+                                    multimask_output=False,
+                                )
+                                
+                                # マスク予測を取得して後処理
+                                mask_pred = mask_predictions[0]  # [1, 1, H, W]
+                                mask_pred = torch.sigmoid(mask_pred)
+                                mask_binary = (mask_pred > 0.5).float()
+                                mask_np = mask_binary[0, 0].cpu().numpy()
+                                masks.append(mask_np)
+                                
+                                print(f"マスク {len(masks)} を生成しました: 形状={mask_np.shape}")
+                        
                         except Exception as e:
-                            print(f"隠れ状態抽出中にエラーが発生しました: {str(e)}")
+                            print(f"マスク生成中にエラーが発生しました: {str(e)}")
                             import traceback
                             traceback.print_exc()
-
-                            # フォールバック: 各<seg>トークンの位置を個別に処理
-                            print("フォールバック方法を試行: トークン位置を個別に処理します")
-
-                            # セグメンテーショントークンの位置を配列として取得
-                            seg_positions = []
-                            for b_idx in range(seg_token_mask.shape[0]):
-                                # このバッチでの<seg>トークンの位置を取得
-                                positions = torch.where(seg_token_mask[b_idx])[
-                                    0].tolist()
-                                for pos in positions:
-                                    seg_positions.append((b_idx, pos))
-
-                            # 見つかった各位置について処理
-                            for batch_idx, pos in seg_positions:
-                                try:
-                                    # この位置までのシーケンスを抽出
-                                    input_ids_segment = generate_ids[batch_idx, :pos+1].unsqueeze(
-                                        0)
-                                    attention_mask_segment = torch.ones_like(
-                                        input_ids_segment)
-
-                                    # フォワードパスを実行して隠れ状態を取得
-                                    with torch.no_grad():
-                                        outputs = self.model(
-                                            input_ids=input_ids_segment,
-                                            attention_mask=attention_mask_segment,
-                                            pixel_values=image_embedding,
-                                            aspect_ratio_ids=torch.zeros_like(
-                                                input_ids_segment).to(model_device),
-                                            aspect_ratio_mask=torch.ones_like(
-                                                input_ids_segment).to(model_device),
-                                            output_hidden_states=True,
-                                            return_dict=True
-                                        )
-
-                                        # 最後の位置（<seg>トークン）の隠れ状態を取得
-                                        hidden_states = outputs.hidden_states[-1][0, -1]
-
-                                        # 以下は変更なし - SAMでマスク生成
-                                        point_embedding = self.seg_projection(
-                                            hidden_states)
-                                        sam_device = next(
-                                            self.sam.parameters()).device
-                                        point_embedding = point_embedding.to(
-                                            sam_device)
-
-                                        sparse_embeddings = point_embedding.unsqueeze(
-                                            0)
-                                        mask_predictions, _ = self.sam.mask_decoder(
-                                            image_embeddings=image_embedding,
-                                            image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                                            sparse_prompt_embeddings=sparse_embeddings,
-                                            dense_prompt_embeddings=None,
-                                            multimask_output=False,
-                                        )
-
-                                        mask_pred = mask_predictions[0]
-                                        mask_pred = torch.sigmoid(mask_pred)
-                                        mask_binary = (mask_pred > 0.5).float()
-                                        mask_np = mask_binary[0, 0].cpu(
-                                        ).numpy()
-                                        masks.append(mask_np)
-
-                                        print(
-                                            f"フォールバック方法でマスク {len(masks)} を生成しました")
-
-                                except Exception as e2:
-                                    print(f"フォールバック方法でもエラーが発生: {str(e2)}")
-                                    traceback.print_exc()
-
+                
                 except Exception as e:
                     print(f"トークン生成中にエラーが発生しました: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     return {"masks": [], "text": f"エラー: {str(e)}"}
-
+            
             except Exception as e:
                 print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
                 import traceback
                 traceback.print_exc()
                 return {"masks": [], "text": f"エラー: {str(e)}"}
-
+        
         except Exception as e:
-            print(f"テキスト生成処理中にエラーが発生: {str(e)}")
+            print(f"セグメンテーション生成中にエラーが発生しました: {str(e)}")
             import traceback
             traceback.print_exc()
             return {"masks": [], "text": f"エラー: {str(e)}"}
+        
+        # 特殊トークンを含まないクリーンなテキストを取得
+        clean_text = self.processor.tokenizer.batch_decode(
+            generate_ids, skip_special_tokens=True
+        )[0]
 
         # 生成テキストとマスクを含む辞書を返す
-        return {"masks": masks, "text": decoded_text}
+        return {"masks": masks, "text": clean_text}
 
     @classmethod
     def from_pretrained(cls, model_path, sam_checkpoint=None, use_deepspeed=False, ds_config=None, local_rank=-1, **kwargs):
