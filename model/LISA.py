@@ -288,35 +288,22 @@ class LISAForCausalLM(nn.Module):
 
     def initialize_lisa_modules(self, sam_checkpoint=None):
         """
-        LISAの追加モジュール（SAM、セグメンテーション投影など）を初期化
+        LISAの追加モジュール（SAMなど）を初期化
         """
-        # SAMチェックポイントがあれば、SAMをロード
         if sam_checkpoint:
             print(f"SAMチェックポイント: {sam_checkpoint}")
             try:
                 print(f"SAMチェックポイントを読み込みます: {sam_checkpoint}")
-                self.sam = build_sam_vit_h(checkpoint=sam_checkpoint)
-
-                # SAMモデルをGPUに移動
+                self.sam = build_sam_vit_h(sam_checkpoint)
+                
+                # SAMを同じデバイスに移動
                 print(f"SAMモデルを {self.device} デバイスに移動します...")
                 self.sam.to(self.device)
-
-                # デバイスがCUDAの場合、SAMモデルを半精度に変換
-                if self.device == "cuda" and self.dtype == torch.float16:
-                    print("SAMモデルを半精度（float16）に変換します...")
-                    # モデル全体を半精度に変換
-                    self.sam = self.sam.half()
-
-                    # すべてのパラメータが確実に半精度になるよう明示的に変換
-                    for name, param in self.sam.named_parameters():
-                        param.data = param.data.half()
-                        if param._grad is not None:
-                            param._grad.data = param._grad.data.half()
-
-                    # すべてのバッファも半精度に変換
-                    for name, buf in self.sam.named_buffers():
-                        buf.data = buf.data.half()
-
+                
+                # 高速化のためにSAMモデルを半精度に変換
+                if self.dtype == torch.float16 or self.dtype == torch.bfloat16:
+                    print(f"SAMモデルを半精度（{self.dtype}）に変換します...")
+                    self.sam = self.sam.to(self.dtype)
                     print("SAMモデルを半精度に変換しました")
 
                 # SAMパラメータを凍結
@@ -328,7 +315,41 @@ class LISAForCausalLM(nn.Module):
 
                 # テキスト->SAMプロンプト投影（Llama 3.2 Visionの隠れ状態次元から256次元へ）
                 # Llama 3.2 Visionのhidden_sizeはtext_configのhidden_sizeから取得
-                hidden_size = self.model.config.text_config.hidden_size
+                try:
+                    # DeepSpeedを使用している場合
+                    if self.use_deepspeed:
+                        # DeepSpeedモデルのconfigアクセス方法
+                        if hasattr(self.model, "module"):
+                            if hasattr(self.model.module, "config"):
+                                # configオブジェクトを取得
+                                config = self.model.module.config
+                                
+                                # Mllamaモデルの場合の特殊な対応
+                                if hasattr(config, "text_config"):
+                                    hidden_size = config.text_config.hidden_size
+                                    print(f"text_configからhidden_size取得: {hidden_size}")
+                                else:
+                                    # dictの場合やtext_configが存在しない場合の対応
+                                    if isinstance(config, dict) and "text_config" in config:
+                                        hidden_size = config["text_config"]["hidden_size"]
+                                        print(f"text_config dictからhidden_size取得: {hidden_size}")
+                                    else:
+                                        # フォールバック: 一般的なサイズを使用
+                                        print("警告: モデル設定からhidden_sizeを取得できません。デフォルト値4096を使用します。")
+                                        hidden_size = 4096  # Llama-3.2の一般的なサイズ
+                            else:
+                                print("警告: モデルmoduleにconfigがありません。デフォルト値4096を使用します。")
+                                hidden_size = 4096
+                        else:
+                            print("警告: モデルにmodule属性がありません。デフォルト値4096を使用します。")
+                            hidden_size = 4096
+                    else:
+                        # 通常のモデル（非DeepSpeed）
+                        hidden_size = self.model.config.text_config.hidden_size
+                except Exception as e:
+                    print(f"hidden_size取得中にエラー発生: {e}")
+                    print("デフォルト値4096を使用します")
+                    hidden_size = 4096  # フォールバック値
 
                 # セグメンテーション投影を初期化
                 print(f"セグメンテーション投影を初期化: {hidden_size} -> 256")
@@ -371,10 +392,24 @@ class LISAForCausalLM(nn.Module):
         """
         try:
             print("SAM前処理を実行中...")
-            h, w = image.shape[:2]
+            
+            # PIL画像をnumpy配列に変換
+            if hasattr(image, 'size'):  # PIL画像
+                # PIL.Imageからnumpy配列に変換
+                img_width, img_height = image.size
+                print(f"PIL画像サイズ: {img_width}x{img_height}")
+                # PIL画像をnumpy配列に変換
+                image_np = np.array(image)
+                h, w = image_np.shape[:2]
+            elif hasattr(image, 'shape'):  # 既にnumpy配列
+                h, w = image.shape[:2]
+                image_np = image
+            else:
+                raise ValueError(f"未対応の画像タイプ: {type(image)}")
+                
             print(f"SAM変換を初期化しました (target_size=1024)")
             transform = ResizeLongestSide(long_side_length=1024)
-            input_image = transform.apply_image(image)
+            input_image = transform.apply_image(image_np)
 
             # 画像パディング情報を出力
             input_size = input_image.shape[:2]
@@ -402,11 +437,13 @@ class LISAForCausalLM(nn.Module):
                     image_embedding = self.sam.image_encoder(input_image_torch)
                     print(f"SAM画像埋め込みのシェイプ: {image_embedding.shape}")
 
-                return image_embedding, image.shape[:2]
+                return image_embedding, (h, w)  # 元のサイズをタプルで返す
             else:
                 raise ValueError("SAMモデルのimage_encoderが初期化されていません")
         except Exception as e:
             print(f"SAM前処理を実行中にエラーが発生: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise e
 
     def generate_segmentation(self, image, text_prompt, **kwargs):
