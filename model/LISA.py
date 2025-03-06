@@ -14,6 +14,7 @@ from .segment_anything import sam_model_registry
 from .segment_anything.utils.transforms import ResizeLongestSide
 import cv2
 import json
+import shutil
 
 
 class LISAForCausalLM(nn.Module):
@@ -30,7 +31,8 @@ class LISAForCausalLM(nn.Module):
         max_batch_size=1,
         use_deepspeed=False,
         ds_config=None,
-        local_rank=-1
+        local_rank=-1,
+        image_size=1024  # image_sizeをコンストラクタの引数に追加
     ):
         """
         LISAモデルの初期化
@@ -44,6 +46,7 @@ class LISAForCausalLM(nn.Module):
             use_deepspeed: DeepSpeedを使用するかどうか
             ds_config: DeepSpeed設定ファイルのパス
             local_rank: ローカルランク（分散学習用）
+            image_size: SAMの画像サイズと出力セグメンテーション画像サイズ (デフォルト: 1024)
         """
         super().__init__()
         
@@ -54,13 +57,12 @@ class LISAForCausalLM(nn.Module):
         self.use_deepspeed = use_deepspeed
         self.ds_config = ds_config
         self.local_rank = local_rank
-        
-        # SAMの画像サイズを初期化
-        self.sam_image_size = 1024
+        self.sam_image_size = image_size  # sam_image_sizeを初期化
         self.transform = None
         
         # データ型の設定（GPUが利用可能であればfloat16、そうでなければfloat32）
-        self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.dtype = self.torch_dtype  # 別名
         
         # モデル初期化
         self.model = None
@@ -243,20 +245,37 @@ class LISAForCausalLM(nn.Module):
             
             # 保存したリサイズ済みモデルを使ってDeepSpeedを初期化
             print(f"リサイズしたモデルを使用してDeepSpeedを初期化: {temp_save_dir}")
-            self.model, _, _, _ = deepspeed.initialize(
-                model=model_class.from_pretrained(
+            try:
+                self.model, _, _, _ = deepspeed.initialize(
+                    model=model_class.from_pretrained(
+                        temp_save_dir,
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                    ),
+                    config=self.ds_config,
+                    model_parameters=None,
+                )
+                print("DeepSpeedの初期化が成功しました")
+            except Exception as e:
+                print(f"DeepSpeed初期化エラー: {str(e)}")
+                print("標準モデルにフォールバックします")
+                
+                # エラー時のフォールバック: 標準モデルを使用
+                self.model = model_class.from_pretrained(
                     temp_save_dir,
                     trust_remote_code=True,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                ),
-                config=self.ds_config,
-                model_parameters=None,
-            )
+                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                ).to(self.device)
+                print("標準モデルを使用します")
             
             # 一時チェックポイントを削除
-            import shutil
-            shutil.rmtree(temp_save_dir, ignore_errors=True)
-            print("一時モデルチェックポイントを削除しました")
+            try:
+                shutil.rmtree(temp_save_dir, ignore_errors=True)
+                print("一時モデルチェックポイントを削除しました")
+            except Exception as e:
+                print(f"一時ディレクトリの削除エラー: {str(e)}")
             
             # デバイスパラメータの設定
             if self.device is None and torch.cuda.is_available():
@@ -277,6 +296,7 @@ class LISAForCausalLM(nn.Module):
                     model_path,
                     trust_remote_code=True,
                     torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
                 )
                 print("MllamaForConditionalGenerationを使用します")
                 
@@ -378,6 +398,7 @@ class LISAForCausalLM(nn.Module):
                     model_path,
                     trust_remote_code=True,
                     torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
                 ).to(self.device)
                 print("代わりにAutoModelForCausalLMを使用します")
                 
@@ -425,10 +446,6 @@ class LISAForCausalLM(nn.Module):
         if not hasattr(self, "sam_image_size"):
             self.sam_image_size = 1024
             print(f"sam_image_sizeを{self.sam_image_size}に設定しました")
-        
-        # 出力画像サイズも設定（セグメンテーション出力用）
-        self.image_size = self.sam_image_size
-        print(f"セグメンテーション出力のimage_sizeを{self.image_size}に設定しました")
         
         # モデルのLLM次元を取得
         print("LLMの隠れ層次元を取得します...")
@@ -989,10 +1006,9 @@ class LISAForCausalLM(nn.Module):
                                     except Exception as cpu_error:
                                         print(f"CPUでの処理も失敗しました: {str(cpu_error)}")
                                         # ダミーの隠れ状態とマスク情報を返し、次のトークンへ
-                                        # image_size属性がない場合のためのフォールバック
-                                        img_size = getattr(self, "image_size", 1024)
+                                        # 出力画像サイズとしてsam_image_sizeを使用
                                         masks.append({
-                                            "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
+                                            "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
                                             "area": 0,
                                             "predicted_iou": 0.0,
                                             "stability_score": 0.0,
@@ -1037,11 +1053,9 @@ class LISAForCausalLM(nn.Module):
                                             masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
                                         
                                         # マスクをリサイズして画像の元のサイズに合わせる
-                                        # image_size属性がない場合のためのフォールバック
-                                        img_size = getattr(self, "image_size", 1024)
                                         mask = F.interpolate(
                                             masks_predictions,
-                                            size=(img_size, img_size),
+                                            size=(self.sam_image_size, self.sam_image_size),
                                             mode="bilinear",
                                             align_corners=False,
                                         )
@@ -1061,7 +1075,7 @@ class LISAForCausalLM(nn.Module):
                                         print(f"マスク生成中にエラー: {str(mask_error)}")
                                         # ダミーのマスクを追加
                                         masks.append({
-                                            "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                            "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
                                             "area": 0,
                                             "predicted_iou": 0.0,
                                             "stability_score": 0.0,
@@ -1071,10 +1085,8 @@ class LISAForCausalLM(nn.Module):
                                 else:
                                     print(
                                         "警告: hidden_statesが取得できませんでした")
-                                    # image_size属性がない場合のためのフォールバック
-                                    img_size = getattr(self, "image_size", 1024)
                                     masks.append({
-                                        "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
+                                        "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
                                         "area": 0,
                                         "predicted_iou": 0.0,
                                         "stability_score": 0.0,
@@ -1083,10 +1095,8 @@ class LISAForCausalLM(nn.Module):
                         
                         except Exception as seg_error:
                             print(f"セグメンテーショントークン処理中にエラー: {str(seg_error)}")
-                            # image_size属性がない場合のためのフォールバック
-                            img_size = getattr(self, "image_size", 1024)
                             masks.append({
-                                "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
+                                "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
                                 "area": 0,
                                 "predicted_iou": 0.0,
                                 "stability_score": 0.0,
