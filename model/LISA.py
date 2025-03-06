@@ -534,25 +534,15 @@ class LISAForCausalLM(nn.Module):
                         (b, n_media, n_tiles), dtype=torch.long, device=device)
                     print("aspect_ratio_ids と aspect_ratio_mask を生成しました")
 
+                # 生成パラメータ設定
                 # top_kがNoneまたは大きすぎる場合の安全対策
-                if top_k is None or not isinstance(top_k, int) or top_k < 1:
-                    top_k = 30  # 安全なデフォルト値
-                elif top_k > 50:
-                    top_k = 50  # 安全な最大値に制限
-                    
+                if top_k is None or top_k > 50:
+                    top_k = 30  # 安全な最大値に制限
                 print(f"使用するtop_k値: {top_k}")
 
                 # 異常値回避のためのパラメータ検証
                 temperature = max(0.1, min(2.0, temperature))  # 0.1~2.0の範囲に制限
                 top_p = max(0.1, min(0.99, top_p))  # 0.1~0.99の範囲に制限
-                
-                # num_beamsも検証
-                if num_beams > 1 and do_sample:
-                    print("警告: do_sampleとnum_beams > 1の両方を指定すると問題が発生する可能性があります。do_sampleをFalseに設定します。")
-                    do_sample = False
-                    
-                # パラメータログ
-                print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, do_sample={do_sample}, num_beams={num_beams}")
 
                 generation_params = {
                     "input_ids": model_inputs["input_ids"],
@@ -586,15 +576,12 @@ class LISAForCausalLM(nn.Module):
                             if torch.isnan(v).any() or torch.isinf(v).any():
                                 print(f"警告: {k}にNaNまたはInf値が含まれています。修正します。")
                                 generation_params[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
-                                
+                    
+                    # 生成パラメータを安全な設定に微調整
+                    print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, do_sample={do_sample}, num_beams={num_beams}")
+                    
                     print("DeepSpeed環境でgenerateを実行します")
                     
-                    # スコアがNaNになる問題を回避するためにdo_sampleをオフにするオプション
-                    use_safe_sampling = True
-                    if use_safe_sampling and do_sample and temperature <= 0.1:
-                        print("安全な生成のためtemperatureを0.2に引き上げます")
-                        generation_params["temperature"] = 0.2
-                        
                     # DeepSpeedのモジュールを使用して生成
                     generate_outputs = self.model.module.generate(
                         **generation_params)
@@ -614,48 +601,48 @@ class LISAForCausalLM(nn.Module):
                         safe_params = generation_params.copy()
                         safe_params["do_sample"] = False  # グリーディ検索
                         safe_params["num_beams"] = 1  # ビームサーチを無効化
-                        safe_params["top_k"] = 10  # 小さな値
+                        safe_params["top_k"] = 1  # 最も安全
                         safe_params["temperature"] = 1.0  # ニュートラル
-                        safe_params["max_new_tokens"] = min(256, max_new_tokens)  # 短く制限
+                        safe_params["max_new_tokens"] = min(100, max_new_tokens)  # 短く制限
                         
-                        # same deviceで試行
+                        # GPU上での試行を続ける
                         generate_outputs = self.model.module.generate(**safe_params)
                             
                     except Exception as e2:
                         print(f"フォールバック生成でもエラーが発生しました: {str(e2)}")
                         
-                        # CPU処理を試行
+                        # 最終フォールバック - さらに安全な設定で試行
                         try:
-                            print("CPU処理に切り替えます")
+                            print("最終フォールバック: グリーディ生成を試行します")
                             
-                            # CPUに移動する前にGPUキャッシュをクリア
+                            # GPUキャッシュをクリア
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                                
-                            # CPUに移動
-                            cpu_inputs = {}
-                            for k, v in safe_params.items():
-                                if isinstance(v, torch.Tensor):
-                                    cpu_inputs[k] = v.detach().cpu()
-                                else:
-                                    cpu_inputs[k] = v
                             
-                            # さらに安全なパラメータを設定
-                            cpu_inputs["do_sample"] = False  # 確定的
-                            cpu_inputs["max_new_tokens"] = min(100, max_new_tokens)  # さらに短く
+                            # 最も安全な設定
+                            final_params = {
+                                "input_ids": safe_params["input_ids"],
+                                "attention_mask": safe_params["attention_mask"],
+                                "pixel_values": safe_params["pixel_values"],
+                                "aspect_ratio_ids": safe_params["aspect_ratio_ids"],
+                                "aspect_ratio_mask": safe_params["aspect_ratio_mask"],
+                                "max_new_tokens": 25,  # 非常に短く
+                                "do_sample": False,  # グリーディ検索
+                                "num_beams": 1,     # ビームなし
+                                "use_cache": False,  # キャッシュを無効化
+                                "pad_token_id": self.processor.tokenizer.pad_token_id,
+                                "eos_token_id": self.processor.tokenizer.eos_token_id,
+                            }
                             
-                            # CPU上で実行
-                            with torch.no_grad():
-                                model_cpu = self.model.module.to('cpu')
-                                generate_outputs = model_cpu.generate(**cpu_inputs)
-                                # モデルをGPUに戻す
-                                self.model.module.to(device)
+                            # 特殊トークンのみを生成
+                            with torch.inference_mode():
+                                generate_outputs = self.model.module.generate(**final_params)
                                 
                         except Exception as e3:
                             print(f"全ての生成方法が失敗しました: {str(e3)}")
                             # 最終フォールバック - ダミーの結果を返す
                             return {"masks": [], "text": f"テキスト生成に失敗しました: {str(e3)}"}
-                            
+
                 # 生成されたトークンIDを取得
                 generate_ids = generate_outputs.detach()
 
