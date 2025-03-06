@@ -1007,13 +1007,7 @@ class LISAForCausalLM(nn.Module):
                                         print(f"CPUでの処理も失敗しました: {str(cpu_error)}")
                                         # ダミーの隠れ状態とマスク情報を返し、次のトークンへ
                                         # 出力画像サイズとしてsam_image_sizeを使用
-                                        masks.append({
-                                            "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
-                                            "area": 0,
-                                            "predicted_iou": 0.0,
-                                            "stability_score": 0.0,
-                                            "error": str(cpu_error)
-                                        })
+                                        masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
                                         continue  # 次のトークンへ
 
                                 # 隠れ状態を取得
@@ -1038,11 +1032,16 @@ class LISAForCausalLM(nn.Module):
                                     sam_image_embedding = sam_image_embedding.to(prompt_embedding.device)
                                     
                                     try:
+                                        # プロンプト埋め込みの形状調整
+                                        # SAMモデルが期待する形式に変換 - [1, 1, 256]の形状にする
+                                        sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
+                                        print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
+                                        
                                         # SAMモデルでマスクを予測
                                         masks_predictions, scores, logits = self.sam.mask_decoder(
                                             image_embeddings=sam_image_embedding,
                                             image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                                            sparse_prompt_embeddings=prompt_embedding.unsqueeze(0),
+                                            sparse_prompt_embeddings=sparse_embeddings,
                                             dense_prompt_embeddings=None,
                                             multimask_output=False,
                                         )
@@ -1063,45 +1062,30 @@ class LISAForCausalLM(nn.Module):
                                         # マスクを2値化
                                         mask = (mask > 0).float().cpu().numpy()
                                         
-                                        # マスク情報をリストに追加
-                                        masks.append({
-                                            "segmentation": mask[0, 0],
-                                            "area": mask[0, 0].sum().item(),
-                                            "predicted_iou": scores[0].item(),
-                                            "stability_score": 1.0
-                                        })
+                                        # マスク情報をリストに追加 - ただし辞書ではなく直接マスク配列を追加
+                                        masks.append(mask[0, 0])  # 最初のバッチ、最初のマスクのみ使用
+                                        print(f"マスク生成成功: 形状={mask[0, 0].shape}, 型={type(mask[0, 0])}")
                                     
                                     except Exception as mask_error:
                                         print(f"マスク生成中にエラー: {str(mask_error)}")
-                                        # ダミーのマスクを追加
-                                        masks.append({
-                                            "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
-                                            "area": 0,
-                                            "predicted_iou": 0.0,
-                                            "stability_score": 0.0,
-                                            "error": str(mask_error)
-                                        })
+                                        # エラーのトレース表示
+                                        import traceback
+                                        traceback.print_exc()
+                                        # ダミーのマスクを追加 - ただし辞書ではなく直接マスク配列を追加
+                                        dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8)
+                                        masks.append(dummy_mask)
+                                        print(f"ダミーマスク生成: 形状={dummy_mask.shape}")
                                 
                                 else:
-                                    print(
-                                        "警告: hidden_statesが取得できませんでした")
-                                    masks.append({
-                                        "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
-                                        "area": 0,
-                                        "predicted_iou": 0.0,
-                                        "stability_score": 0.0,
-                                        "error": "hidden_states not available"
-                                    })
+                                    print("警告: hidden_statesが取得できませんでした")
+                                    # ダミーのマスクを追加 - 辞書ではなく直接マスク配列を追加
+                                    dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8)
+                                    masks.append(dummy_mask)
+                                    print(f"hidden_statesなしのダミーマスク生成: 形状={dummy_mask.shape}")
                         
                         except Exception as seg_error:
                             print(f"セグメンテーショントークン処理中にエラー: {str(seg_error)}")
-                            masks.append({
-                                "segmentation": np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8),
-                                "area": 0,
-                                "predicted_iou": 0.0,
-                                "stability_score": 0.0,
-                                "error": str(seg_error)
-                            })
+                            masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
                             
                 except Exception as token_error:
                     print(f"トークン処理中にエラー: {str(token_error)}")
@@ -1146,6 +1130,11 @@ class LISAForCausalLM(nn.Module):
                 final_text = final_text.replace(token, "")
         else:
             final_text = "テキスト生成に失敗しました。"
+
+        # マスクの形式を確認して、正しい形式で返す
+        print(f"生成されたマスク数: {len(masks)}")
+        for i, mask in enumerate(masks):
+            print(f"マスク {i+1} の形状: {mask.shape}, 型: {type(mask)}")
 
         return {"masks": masks, "text": final_text.strip()}
 

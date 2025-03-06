@@ -228,6 +228,13 @@ def visualize_results(image, masks, text, output_path):
             if isinstance(mask, torch.Tensor):
                 mask = mask.cpu().numpy()
             
+            # もしマスクが辞書の場合は、segmentationフィールドを使用
+            if isinstance(mask, dict) and "segmentation" in mask:
+                mask = mask["segmentation"]
+            
+            # マスクの形状を表示
+            print(f"処理中のマスク形状: {mask.shape}, 型: {type(mask)}")
+            
             # Create a blended visualization
             vis_image = np.array(image).copy()
             mask_colored = np.zeros_like(vis_image, dtype=np.uint8)
