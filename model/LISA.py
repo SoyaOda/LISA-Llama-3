@@ -113,6 +113,16 @@ class LISAForCausalLM(nn.Module):
         print(f"プロセッサーとモデルをロードしています: {model_path}")
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         
+        # <seg>トークンをトークナイザに追加 - 先にトークナイザに追加（埋め込み拡張前）
+        print(f"トークナイザにセグメンテーショントークンを追加します: {self.seg_token}")
+        num_added_tokens = self.processor.tokenizer.add_tokens([self.seg_token])
+        print(f"追加されたトークン数: {num_added_tokens}")
+        
+        # セグメンテーショントークンのIDを取得
+        self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
+        print(f"セグメンテーショントークンID: {self.seg_token_idx}")
+        print(f"トークナイザの語彙サイズ: {len(self.processor.tokenizer)}")
+        
         # DeepSpeedを使用する場合
         if self.use_deepspeed:
             print("DeepSpeedエンジンを初期化しています...")
@@ -129,16 +139,99 @@ class LISAForCausalLM(nn.Module):
                 model_class = AutoModelForCausalLM
                 print("代わりにAutoModelForCausalLMを使用します")
             
-            # DSの初期化
+            # モデルの初期化（DeepSpeed初期化前）
+            print("モデルを一時的に初期化してトークナイザと同期します")
+            temp_model = model_class.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+            
+            # リサイズ前にモデルの出力層と入力埋め込み層のサイズをチェック
+            print(f"リサイズ前: トークナイザサイズ={len(self.processor.tokenizer)}")
+            
+            # モデル構造に基づいて埋め込み層をリサイズ
+            try:
+                # Mllamaの構造に適した埋め込み層へのアクセス方法
+                if hasattr(temp_model, "language_model"):
+                    input_embeddings = temp_model.language_model.model.embed_tokens
+                    output_embeddings = temp_model.lm_head
+                    print(f"リサイズ前: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                    
+                    # 入力埋め込み層のリサイズ
+                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
+                    
+                    # 出力埋め込み層のリサイズ（必要な場合）
+                    if input_embeddings.weight.shape[0] != output_embeddings.weight.shape[0]:
+                        print("出力埋め込み層をリサイズします...")
+                        # 出力層のリサイズ
+                        old_lm_head = temp_model.get_output_embeddings()
+                        vocab_size_diff = len(self.processor.tokenizer) - old_lm_head.weight.shape[0]
+                        
+                        if vocab_size_diff > 0:
+                            print(f"出力層を拡張します: +{vocab_size_diff}トークン")
+                            new_lm_head_weight = torch.nn.Parameter(
+                                torch.cat([
+                                    old_lm_head.weight,
+                                    torch.zeros(vocab_size_diff, old_lm_head.weight.shape[1], 
+                                              device=old_lm_head.weight.device, 
+                                              dtype=old_lm_head.weight.dtype)
+                                ], dim=0)
+                            )
+                            # 平均で初期化
+                            with torch.no_grad():
+                                mean_weights = old_lm_head.weight.mean(dim=0, keepdim=True)
+                                new_lm_head_weight[-vocab_size_diff:] = mean_weights
+                            
+                            # 新しい出力層を設定
+                            old_lm_head.weight = new_lm_head_weight
+                            temp_model.set_output_embeddings(old_lm_head)
+                            print("出力埋め込み層のリサイズが完了しました")
+                
+                elif hasattr(temp_model, "model"):
+                    # 別の構造のMllamaモデルの場合
+                    print("異なるモデル構造を検出: model属性を使用")
+                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
+                
+                else:
+                    print("未知のモデル構造です。標準的なリサイズを試みます")
+                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
+                
+                # リサイズ後のサイズを確認
+                if hasattr(temp_model, "language_model"):
+                    input_embeddings = temp_model.language_model.model.embed_tokens
+                    output_embeddings = temp_model.lm_head
+                    print(f"リサイズ後: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+            
+            except Exception as resize_error:
+                print(f"埋め込み層のリサイズ中にエラーが発生しました: {str(resize_error)}")
+                print("警告: モデルは標準のトークナイザサイズのままです")
+                
+            # 一時モデルの状態をチェックポイントとして保存
+            print("リサイズしたモデルを一時チェックポイントとして保存します")
+            temp_save_dir = "./temp_resized_model"
+            os.makedirs(temp_save_dir, exist_ok=True)
+            temp_model.save_pretrained(temp_save_dir)
+            del temp_model
+            torch.cuda.empty_cache()
+            
+            # 保存したリサイズ済みモデルを使ってDeepSpeedを初期化
+            print(f"リサイズしたモデルを使用してDeepSpeedを初期化: {temp_save_dir}")
             self.model, _, _, _ = deepspeed.initialize(
                 model=model_class.from_pretrained(
-                    model_path,
+                    temp_save_dir,
                     trust_remote_code=True,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 ),
                 config=self.ds_config,
                 model_parameters=None,
             )
+            
+            # 一時チェックポイントを削除
+            import shutil
+            shutil.rmtree(temp_save_dir, ignore_errors=True)
+            print("一時モデルチェックポイントを削除しました")
+            
             # デバイスパラメータの設定
             if self.device is None and torch.cuda.is_available():
                 self.device = f"cuda:{self.local_rank}"
@@ -153,12 +246,62 @@ class LISAForCausalLM(nn.Module):
             
             # モデルをロード
             try:
+                # まず標準のモデルをロード
                 self.model = MllamaForConditionalGeneration.from_pretrained(
                     model_path,
                     trust_remote_code=True,
                     torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-                ).to(self.device)
+                )
                 print("MllamaForConditionalGenerationを使用します")
+                
+                # リサイズ前にモデルの出力層と入力埋め込み層のサイズをチェック
+                if hasattr(self.model, "language_model"):
+                    input_embeddings = self.model.language_model.model.embed_tokens
+                    output_embeddings = self.model.lm_head
+                    print(f"リサイズ前: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                    
+                    # 入力埋め込み層のリサイズ
+                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                    
+                    # 出力埋め込み層のリサイズ（必要な場合）
+                    if input_embeddings.weight.shape[0] != output_embeddings.weight.shape[0]:
+                        print("出力埋め込み層をリサイズします...")
+                        # 出力層のリサイズ
+                        old_lm_head = self.model.get_output_embeddings()
+                        vocab_size_diff = len(self.processor.tokenizer) - old_lm_head.weight.shape[0]
+                        
+                        if vocab_size_diff > 0:
+                            print(f"出力層を拡張します: +{vocab_size_diff}トークン")
+                            new_lm_head_weight = torch.nn.Parameter(
+                                torch.cat([
+                                    old_lm_head.weight,
+                                    torch.zeros(vocab_size_diff, old_lm_head.weight.shape[1], 
+                                              device=old_lm_head.weight.device, 
+                                              dtype=old_lm_head.weight.dtype)
+                                ], dim=0)
+                            )
+                            # 平均で初期化
+                            with torch.no_grad():
+                                mean_weights = old_lm_head.weight.mean(dim=0, keepdim=True)
+                                new_lm_head_weight[-vocab_size_diff:] = mean_weights
+                            
+                            # 新しい出力層を設定
+                            old_lm_head.weight = new_lm_head_weight
+                            self.model.set_output_embeddings(old_lm_head)
+                            print("出力埋め込み層のリサイズが完了しました")
+                    
+                    # リサイズ後のサイズを確認
+                    input_embeddings = self.model.language_model.model.embed_tokens
+                    output_embeddings = self.model.lm_head
+                    print(f"リサイズ後: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                
+                else:
+                    print("異なるモデル構造を検出: 標準的なリサイズを試みます")
+                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                
+                # デバイスに移動
+                self.model = self.model.to(self.device)
+                
             except Exception as e:
                 print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -167,28 +310,38 @@ class LISAForCausalLM(nn.Module):
                     torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
                 ).to(self.device)
                 print("代わりにAutoModelForCausalLMを使用します")
+                
+                # 標準的なモデルのリサイズ
+                try:
+                    print("標準的なリサイズを試みます")
+                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                except Exception as resize_error:
+                    print(f"標準的なリサイズに失敗: {str(resize_error)}")
         
         print(f"モデルのデバイス: {self.device}")
+        print(f"トークナイザの最終語彙サイズ: {len(self.processor.tokenizer)}")
         
-        # モデルの語彙サイズをトークナイザと一致させる（重要な修正）
-        # これによりScatterGatherKernelエラーを解消
-        tokenizer_vocab_size = len(self.processor.tokenizer)
-        if hasattr(self.model, "module"):
-            model_vocab_size = self.model.module.config.text_config.vocab_size
-            if tokenizer_vocab_size != model_vocab_size:
-                print(f"語彙サイズの不一致を検出: モデル={model_vocab_size}, トークナイザ={tokenizer_vocab_size}")
-                print(f"モデルの語彙サイズをトークナイザに合わせて調整します")
-                # DeepSpeedモデルの場合は内部モジュールを使う
-                self.model.module.resize_token_embeddings(tokenizer_vocab_size)
-        else:
-            model_vocab_size = self.model.config.text_config.vocab_size
-            if tokenizer_vocab_size != model_vocab_size:
-                print(f"語彙サイズの不一致を検出: モデル={model_vocab_size}, トークナイザ={tokenizer_vocab_size}")
-                print(f"モデルの語彙サイズをトークナイザに合わせて調整します")
-                self.model.resize_token_embeddings(tokenizer_vocab_size)
+        # マスキングするトークンIDを保存
+        # 画像トークンなど、損失計算や生成から除外するトークンを設定
+        self.special_token_ids = []
+        # 画像トークンを特定（もし存在すれば）
+        image_token = "<|image|>"
+        if image_token in self.processor.tokenizer.get_vocab():
+            image_token_id = self.processor.tokenizer.convert_tokens_to_ids(image_token)
+            self.special_token_ids.append(image_token_id)
+            print(f"画像トークン {image_token} (ID: {image_token_id}) を特殊トークンとして登録しました")
         
-        # <seg>トークンをトークナイザに追加
-        self.expand_embedding_layer(self.seg_token)
+        # PADトークンの追加と登録（必要な場合）
+        if self.processor.tokenizer.pad_token is None:
+            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+            print(f"PADトークンをEOSトークン ({self.processor.tokenizer.eos_token}) に設定しました")
+        
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            self.special_token_ids.append(pad_token_id)
+            print(f"PADトークン (ID: {pad_token_id}) を特殊トークンとして登録しました")
+        
+        print(f"損失計算から除外される特殊トークンIDs: {self.special_token_ids}")
 
     def initialize_lisa_modules(self, sam_checkpoint=None):
         """
@@ -253,7 +406,7 @@ class LISAForCausalLM(nn.Module):
                             print("警告: モデルにmodule属性がありません。デフォルト値4096を使用します。")
                             hidden_size = 4096
                     else:
-                        # 通常のモデル（非DeepSpeed）
+                        # 通常のモデル
                         hidden_size = self.model.config.text_config.hidden_size
                 except Exception as e:
                     print(f"hidden_size取得中にエラー発生: {e}")
@@ -886,78 +1039,99 @@ class LISAForCausalLM(nn.Module):
             **kwargs
         )
 
-    def expand_embedding_layer(self, new_token):
+    def train_step(self, batch, optimizer):
         """
-        モデルの埋め込み層を拡張して新しいトークンを追加
+        学習ステップを実行する関数
+        """
+        # 入力データの準備
+        input_ids = batch["input_ids"].to(self.device)
+        attention_mask = batch["attention_mask"].to(self.device)
+        labels = batch["labels"].to(self.device)
         
-        Args:
-            new_token: 追加する新しいトークン
-        """
-        try:
-            print(f"トークナイザと埋め込み層を拡張: {new_token}")
+        # 特殊トークンを損失計算から除外（-100は無視される）
+        if hasattr(self, "special_token_ids") and self.special_token_ids:
+            for token_id in self.special_token_ids:
+                labels[labels == token_id] = -100
+        
+        # 画像データがある場合
+        if "pixel_values" in batch:
+            pixel_values = batch["pixel_values"].to(self.device)
             
-            # トークナイザに新しいトークンが含まれているかチェック
-            if new_token not in self.processor.tokenizer.get_vocab():
-                print(f"トークナイザに新トークンを追加: {new_token}")
-                num_added_tokens = self.processor.tokenizer.add_tokens([new_token])
-                print(f"追加されたトークン数: {num_added_tokens}")
-                
-                # トークンIDを取得
-                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
-                print(f"新トークンID: {self.seg_token_idx}")
-                
-                # モデルの埋め込み層を拡張
-                if self.use_deepspeed:
-                    print("DeepSpeedモデルの埋め込み層を拡張...")
-                    # DeepSpeedモデルではmoduleを通してアクセス
-                    vocab_size = len(self.processor.tokenizer)
-                    current_vocab_size = self.model.module.config.text_config.vocab_size
-                    
-                    if vocab_size > current_vocab_size:
-                        print(f"埋め込み層を拡張: {current_vocab_size} -> {vocab_size}")
-                        try:
-                            self.model.module.resize_token_embeddings(vocab_size)
-                            print("埋め込み層の拡張が完了しました")
-                        except Exception as e:
-                            print(f"埋め込み層拡張中にエラー: {str(e)}")
-                            print("このエラーは無視してください - トークンIDは取得済みです")
-                else:
-                    # 通常のモデルの場合
-                    vocab_size = len(self.processor.tokenizer)
-                    current_vocab_size = self.model.config.text_config.vocab_size
-                    
-                    if vocab_size > current_vocab_size:
-                        print(f"埋め込み層を拡張: {current_vocab_size} -> {vocab_size}")
-                        try:
-                            self.model.resize_token_embeddings(vocab_size)
-                            print("埋め込み層の拡張が完了しました")
-                        except Exception as e:
-                            print(f"埋め込み層拡張中にエラー: {str(e)}")
-                            print("このエラーは無視してください - トークンIDは取得済みです")
+            # アスペクト比情報（画像のタイル処理用）があれば取得
+            aspect_ratio_ids = batch.get("aspect_ratio_ids", None)
+            if aspect_ratio_ids is not None:
+                aspect_ratio_ids = aspect_ratio_ids.to(self.device)
+            
+            aspect_ratio_mask = batch.get("aspect_ratio_mask", None)
+            if aspect_ratio_mask is not None:
+                aspect_ratio_mask = aspect_ratio_mask.to(self.device)
+            
+            # DeepSpeedの場合
+            if self.use_deepspeed:
+                # DeepSpeedモデルのforwardを呼び出し
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    pixel_values=pixel_values,
+                    aspect_ratio_ids=aspect_ratio_ids,
+                    aspect_ratio_mask=aspect_ratio_mask,
+                    return_dict=True
+                )
             else:
-                # すでにトークンが存在する場合、IDだけを取得
-                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
-                print(f"既存トークンのIDを取得: {self.seg_token_idx}")
-                
-        except Exception as e:
-            print(f"トークン拡張処理中にエラーが発生: {str(e)}")
-            # バックアップ処理: エラーが発生した場合でもトークンIDを取得
-            try:
-                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
-                print(f"エラー後のフォールバック: トークンID = {self.seg_token_idx}")
-            except:
-                print("警告: トークンIDの取得に失敗しました。デフォルト値を使用します。")
-                self.seg_token_idx = -100  # デフォルト値
+                # 通常のPyTorchモデル
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    pixel_values=pixel_values,
+                    aspect_ratio_ids=aspect_ratio_ids,
+                    aspect_ratio_mask=aspect_ratio_mask,
+                    return_dict=True
+                )
+        else:
+            # テキストのみの場合
+            if self.use_deepspeed:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True
+                )
+            else:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True
+                )
+        
+        # 損失の取得
+        loss = outputs.loss
+        
+        # DeepSpeedの場合はbackward()をDeepSpeedが処理
+        if self.use_deepspeed:
+            self.model.backward(loss)
+            self.model.step()
+        else:
+            # 通常のPyTorch
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        return loss.item()
 
 
 def build_sam_vit_h(checkpoint=None):
     """
-    SAM ViT-Hモデルを構築
+    SAM ViT-H モデルを構築
     """
-    try:
-        from .segment_anything import sam_model_registry
-        print(f"SAMモデルを構築します: vit_h")
-        return sam_model_registry["vit_h"](checkpoint=checkpoint)
-    except Exception as e:
-        print(f"SAMモデル構築中にエラー: {e}")
-        return None
+    from .segment_anything import sam_model_registry
+    
+    model_type = "vit_h"
+    sam = sam_model_registry[model_type](checkpoint=checkpoint)
+    if checkpoint is not None:
+        print(f"SAMチェックポイントから重みを読み込みました: {checkpoint}")
+    else:
+        print("SAMチェックポイントが指定されていません - 学習済み重みなしで初期化します")
+    return sam
