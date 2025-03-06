@@ -58,11 +58,15 @@ class LISAForCausalLM(nn.Module):
         # データ型の設定（GPUが利用可能であればfloat16、そうでなければfloat32）
         self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
+        # SAM画像サイズの設定 (SAMのデフォルト入力サイズ)
+        self.sam_image_size = 1024
+        
         # モデル初期化
         self.model = None
         self.processor = None
         self.initialize_llama(model_path)
-        self.transform = ResizeLongestSide(self.sam_image_size)
+        # transformの初期化はSAMモデルが利用可能になった後に行うため、ここでは行わない
+        # self.transform = ResizeLongestSide(self.sam_image_size)
         
         # SAMモデルがある場合は初期化
         self.sam = None
@@ -347,6 +351,7 @@ class LISAForCausalLM(nn.Module):
         """
         LISAの追加モジュール（SAMなど）を初期化
         """
+        # SAMモデルとtransformの初期化
         if sam_checkpoint:
             print(f"SAMチェックポイント: {sam_checkpoint}")
             try:
@@ -369,7 +374,11 @@ class LISAForCausalLM(nn.Module):
                     param.requires_grad = False
 
                 print("SAMモデルが正常に初期化されました")
-
+                
+                # SAMモデルが初期化された後にtransformを設定
+                self.transform = ResizeLongestSide(self.sam.image_encoder.img_size)
+                print(f"SAM画像リサイズ変換を初期化しました（サイズ: {self.sam.image_encoder.img_size}）")
+                
                 # テキスト->SAMプロンプト投影（Llama 3.2 Visionの隠れ状態次元から256次元へ）
                 # Llama 3.2 Visionのhidden_sizeはtext_configのhidden_sizeから取得
                 try:
@@ -389,7 +398,7 @@ class LISAForCausalLM(nn.Module):
                                 else:
                                     # dictの場合やtext_configが存在しない場合の対応
                                     if isinstance(
-    config, dict) and "text_config" in config:
+                                        config, dict) and "text_config" in config:
                                         hidden_size = config["text_config"]["hidden_size"]
                                         print(
                                             f"text_config dictからhidden_size取得: {hidden_size}")
@@ -423,12 +432,19 @@ class LISAForCausalLM(nn.Module):
                 # 重みを初期化（Kaiming初期化）
                 nn.init.kaiming_normal_(
                     self.seg_projection.weight, nonlinearity='relu')
-
+                    
             except Exception as e:
-                print(f"SAMモデルの初期化中にエラーが発生しました: {e}")
+                print(f"SAMの初期化中にエラーが発生しました: {e}")
                 import traceback
                 traceback.print_exc()
+                # SAMの初期化に失敗した場合も、デフォルトのサイズでtransformを初期化
+                self.transform = ResizeLongestSide(self.sam_image_size)
+                print(f"デフォルトサイズでSAM画像リサイズ変換を初期化しました（サイズ: {self.sam_image_size}）")
                 self.sam = None
+        else:
+            # SAMチェックポイントが指定されていない場合も、デフォルトのサイズでtransformを初期化
+            self.transform = ResizeLongestSide(self.sam_image_size)
+            print(f"SAMモデルなしでリサイズ変換のみ初期化しました（サイズ: {self.sam_image_size}）")
 
     def transform_image(self):
         """
