@@ -15,6 +15,7 @@ from .segment_anything.utils.transforms import ResizeLongestSide
 import cv2
 import json
 import shutil
+import torch.distributed as dist
 
 
 class LISAForCausalLM(nn.Module):
@@ -76,6 +77,25 @@ class LISAForCausalLM(nn.Module):
         # もしDeepSpeed用のds_configが指定されていなければ、ZeRO-2設定をデフォルトで作成
         if self.use_deepspeed and not self.ds_config:
             print("ZeRO-2を使用した安定したDeepSpeed設定を使用します")
+            
+            # world_sizeを取得（DeepSpeedの場合）
+            if dist.is_initialized():
+                world_size = dist.get_world_size()
+            else:
+                world_size = 1
+            
+            # マイクロバッチサイズ
+            micro_batch_size = 1
+            
+            # 勾配累積ステップ
+            grad_accum_steps = 1
+            
+            # 合計バッチサイズを計算（world_sizeに基づく）
+            train_batch_size = micro_batch_size * grad_accum_steps * world_size
+            
+            print(f"DeepSpeed設定: world_size={world_size}, micro_batch={micro_batch_size}, grad_accum={grad_accum_steps}")
+            print(f"計算された合計バッチサイズ: {train_batch_size}")
+            
             self.ds_config = {
                 "fp16": {
                     "enabled": True,
@@ -97,11 +117,11 @@ class LISAForCausalLM(nn.Module):
                     "contiguous_gradients": True,
                     "overlap_comm": True
                 },
-                "gradient_accumulation_steps": 1,
+                "gradient_accumulation_steps": grad_accum_steps,
                 "gradient_clipping": 1.0,
                 "steps_per_print": 50,
-                "train_batch_size": 8,
-                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": train_batch_size,
+                "train_micro_batch_size_per_gpu": micro_batch_size,
                 "wall_clock_breakdown": False
             }
             
@@ -116,6 +136,8 @@ class LISAForCausalLM(nn.Module):
         Llama 3.2 Vision モデルを初期化
         """
         print(f"プロセッサーとモデルをロードしています: {model_path}")
+        
+        # AutoProcessorの場合はtrust_remote_codeを使用
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         
         # <seg>トークンをトークナイザに追加 - 先にトークナイザに追加（埋め込み拡張前）
@@ -128,6 +150,17 @@ class LISAForCausalLM(nn.Module):
         print(f"セグメンテーショントークンID: {self.seg_token_idx}")
         print(f"トークナイザの語彙サイズ: {len(self.processor.tokenizer)}")
         
+        # モデルクラスを選択
+        try:
+            from transformers import MllamaForConditionalGeneration
+            model_class = MllamaForConditionalGeneration
+            print("MllamaForConditionalGenerationを使用します")
+        except Exception as e:
+            print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
+            from transformers import AutoModelForCausalLM
+            model_class = AutoModelForCausalLM
+            print("代わりにAutoModelForCausalLMを使用します")
+        
         # DeepSpeedを使用する場合
         if self.use_deepspeed:
             print("DeepSpeedエンジンを初期化しています...")
@@ -135,21 +168,25 @@ class LISAForCausalLM(nn.Module):
                 self.ds_config = "ds_config.json"
                 print(f"デフォルトDeepSpeed設定ファイルを使用: {self.ds_config}")
             
-            # モデルクラス選択
-            try:
-                model_class = MllamaForConditionalGeneration
-                print("MllamaForConditionalGenerationを使用します")
-            except Exception as e:
-                print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
-                model_class = AutoModelForCausalLM
-                print("代わりにAutoModelForCausalLMを使用します")
-            
             # モデルの初期化（DeepSpeed初期化前）
             print("モデルを一時的に初期化してトークナイザと同期します")
+            
+            # モデルクラスに応じて適切な引数を設定
+            if model_class == AutoModelForCausalLM:
+                model_kwargs = {
+                    "trust_remote_code": True,
+                    "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+                }
+            else:
+                # MllamaForConditionalGenerationの場合はtrust_remote_codeを使用しない
+                model_kwargs = {
+                    "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+                }
+            
+            # 一時モデルの初期化
             temp_model = model_class.from_pretrained(
                 model_path,
-                trust_remote_code=True,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                **model_kwargs
             )
             
             # リサイズ前にモデルの出力層と入力埋め込み層のサイズをチェック
@@ -165,63 +202,10 @@ class LISAForCausalLM(nn.Module):
                 temp_model.resize_token_embeddings(new_vocab_size)
                 print(f"入力埋め込み層をリサイズしました: {new_vocab_size}")
                 
-                # 出力埋め込み層の手動リサイズ
+                # 出力埋め込み層の手動リサイズ（必要な場合）
                 if hasattr(temp_model, "get_output_embeddings") and temp_model.get_output_embeddings() is not None:
                     old_embeddings = temp_model.get_output_embeddings()
                     print(f"出力埋め込み層を取得: {old_embeddings}")
-                    
-                    # 拡張された出力埋め込み層を作成
-                    old_num_tokens = old_embeddings.weight.shape[0]
-                    if old_num_tokens < new_vocab_size:
-                        print(f"出力埋め込み層をリサイズします: {old_num_tokens} -> {new_vocab_size}")
-                        
-                        # 新しい重みを作成
-                        old_weights = old_embeddings.weight.data
-                        new_weights = torch.zeros(
-                            (new_vocab_size, old_weights.shape[1]),
-                            dtype=old_weights.dtype,
-                            device=old_weights.device
-                        )
-                        new_weights[:old_num_tokens, :] = old_weights
-                        
-                        # 新しいトークン埋め込みを平均値で初期化
-                        if new_vocab_size > old_num_tokens:
-                            num_new_tokens = new_vocab_size - old_num_tokens
-                            mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
-                            new_weights[old_num_tokens:, :] = mean_weights
-                        
-                        # 出力埋め込み層の重みを更新
-                        old_embeddings.weight.data = new_weights
-                        print(f"出力埋め込み層のリサイズが完了しました: {new_weights.shape}")
-                else:
-                    print("警告: 出力埋め込み層が見つからないか、アクセスできません")
-                    
-                    # text_modelにアクセスできるか確認
-                    if hasattr(temp_model, "text_model"):
-                        print("text_model経由で埋め込み層にアクセスを試みます")
-                        if hasattr(temp_model.text_model, "lm_head") and temp_model.text_model.lm_head is not None:
-                            lm_head = temp_model.text_model.lm_head
-                            old_num_tokens = lm_head.weight.shape[0]
-                            if old_num_tokens < new_vocab_size:
-                                print(f"text_model.lm_headをリサイズします: {old_num_tokens} -> {new_vocab_size}")
-                                # 同様のリサイズ処理...
-                                old_weights = lm_head.weight.data
-                                new_weights = torch.zeros(
-                                    (new_vocab_size, old_weights.shape[1]),
-                                    dtype=old_weights.dtype,
-                                    device=old_weights.device
-                                )
-                                new_weights[:old_num_tokens, :] = old_weights
-                                
-                                # 新しいトークン埋め込みを平均値で初期化
-                                if new_vocab_size > old_num_tokens:
-                                    num_new_tokens = new_vocab_size - old_num_tokens
-                                    mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
-                                    new_weights[old_num_tokens:, :] = mean_weights
-                                
-                                # 出力埋め込み層の重みを更新
-                                lm_head.weight.data = new_weights
-                                print(f"text_model.lm_headのリサイズが完了しました: {new_weights.shape}")
                 
                 print(f"トークナイザサイズに合わせてモデルをリサイズしました: {new_vocab_size}")
             
@@ -246,12 +230,24 @@ class LISAForCausalLM(nn.Module):
             # 保存したリサイズ済みモデルを使ってDeepSpeedを初期化
             print(f"リサイズしたモデルを使用してDeepSpeedを初期化: {temp_save_dir}")
             try:
+                # モデルクラスに応じて適切な引数を設定
+                if model_class == AutoModelForCausalLM:
+                    model_kwargs = {
+                        "trust_remote_code": True,
+                        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+                        "ignore_mismatched_sizes": True,
+                    }
+                else:
+                    # MllamaForConditionalGenerationの場合はtrust_remote_codeを使用しない
+                    model_kwargs = {
+                        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+                        "ignore_mismatched_sizes": True,
+                    }
+                
                 self.model, _, _, _ = deepspeed.initialize(
                     model=model_class.from_pretrained(
                         temp_save_dir,
-                        trust_remote_code=True,
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                        **model_kwargs
                     ),
                     config=self.ds_config,
                     model_parameters=None,
@@ -264,9 +260,7 @@ class LISAForCausalLM(nn.Module):
                 # エラー時のフォールバック: 標準モデルを使用
                 self.model = model_class.from_pretrained(
                     temp_save_dir,
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                    **model_kwargs
                 ).to(self.device)
                 print("標準モデルを使用します")
             
@@ -291,19 +285,30 @@ class LISAForCausalLM(nn.Module):
             
             # モデルをロード
             try:
+                # モデルクラスに応じて適切な引数を設定
+                if model_class == AutoModelForCausalLM:
+                    model_kwargs = {
+                        "trust_remote_code": True,
+                        "torch_dtype": torch.float16 if "cuda" in self.device else torch.float32,
+                        "ignore_mismatched_sizes": True,
+                    }
+                else:
+                    # MllamaForConditionalGenerationの場合はtrust_remote_codeを使用しない
+                    model_kwargs = {
+                        "torch_dtype": torch.float16 if "cuda" in self.device else torch.float32,
+                        "ignore_mismatched_sizes": True,
+                    }
+                
                 # まず標準のモデルをロード
-                self.model = MllamaForConditionalGeneration.from_pretrained(
+                self.model = model_class.from_pretrained(
                     model_path,
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                    **model_kwargs
                 )
-                print("MllamaForConditionalGenerationを使用します")
+                print(f"{model_class.__name__}を使用します")
                 
                 # デバッグ: モデル構造の詳細を出力
-                print("\n===== MllamaForConditionalGeneration モデル構造 =====")
+                print(f"\n===== {model_class.__name__} モデル構造 =====")
                 print(f"モデルクラス: {type(self.model)}")
-                print(f"モデル属性一覧: {dir(self.model)}")
                 print(f"config属性: {self.model.config}")
                 if hasattr(self.model.config, "text_config"):
                     print(f"text_config属性: {self.model.config.text_config}")
@@ -315,8 +320,8 @@ class LISAForCausalLM(nn.Module):
                 if hasattr(self.model, "get_output_embeddings"):
                     print(f"出力埋め込み層: {self.model.get_output_embeddings()}")
                 
-                # Mllamaモデルの構造を分析してトークナイザに合わせてリサイズ
-                print("Mllamaモデルの構造を分析中...")
+                # モデルの構造を分析してトークナイザに合わせてリサイズ
+                print("モデルの構造を分析中...")
                 
                 # 新しい語彙サイズを取得
                 new_vocab_size = len(self.processor.tokenizer)
@@ -336,11 +341,17 @@ class LISAForCausalLM(nn.Module):
             except Exception as e:
                 print(f"モデル初期化エラー: {str(e)}")
                 print("AutoModelForCausalLMにフォールバックします")
+                
+                # AutoModelForCausalLMの場合の引数
+                model_kwargs = {
+                    "trust_remote_code": True,
+                    "torch_dtype": torch.float16 if "cuda" in self.device else torch.float32,
+                    "ignore_mismatched_sizes": True,
+                }
+                
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-                    ignore_mismatched_sizes=True,  # サイズ不一致を無視
+                    **model_kwargs
                 ).to(self.device)
                 print("代わりにAutoModelForCausalLMを使用します")
                 
