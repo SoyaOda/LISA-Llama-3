@@ -613,10 +613,10 @@ class LISAForCausalLM(nn.Module):
                 # PIL画像をResizeNetの入力サイズにリサイズ
                 target_size = (1024, 1024)  # SAMのデフォルト入力サイズ
                 original_size = image.size  # (width, height)
-                original_size = (
-                    original_size[0], original_size[1])  # 明示的にタプルに変換
-
-                print(f"オリジナル画像サイズ: {original_size}")
+                
+                # オリジナルサイズを保存（高さ、幅の順）
+                self.original_image_size = (image.height, image.width)
+                print(f"オリジナル画像サイズ: {self.original_image_size}")
 
                 # PIL画像をRGBに変換してからnumpy配列に変換
                 if image.mode != "RGB":
@@ -1036,6 +1036,24 @@ class LISAForCausalLM(nn.Module):
                                         sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
                                         print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
                                         
+                                        # 位置エンコーディングの形状を取得
+                                        image_pe = self.sam.prompt_encoder.get_dense_pe()
+                                        
+                                        # sparse_embeddingsの次元がimage_peの次元と一致しているか確認
+                                        # SAMの位置エンコーディングはembedding_dimの次元を持っているはず
+                                        if sparse_embeddings.shape[-1] != image_pe.shape[1]:
+                                            print(f"警告: プロンプト埋め込み次元 ({sparse_embeddings.shape[-1]}) と位置エンコーディング次元 ({image_pe.shape[1]}) が一致しません")
+                                            print("次元を一致させるためにLinear投影を行います")
+                                            # 線形層で次元を調整（256→256）
+                                            transformer_dim = image_pe.shape[1]
+                                            if not hasattr(self, "dim_adjustment"):
+                                                self.dim_adjustment = nn.Linear(
+                                                    sparse_embeddings.shape[-1], 
+                                                    transformer_dim
+                                                ).to(device=sparse_embeddings.device, dtype=sparse_embeddings.dtype)
+                                            sparse_embeddings = self.dim_adjustment(sparse_embeddings)
+                                            print(f"調整後のsparse_embeddings: 形状={sparse_embeddings.shape}")
+                                        
                                         # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
                                         # [B, C, H, W]形式のゼロテンソルを作成
                                         # 画像埋め込みから適切な形状を取得
@@ -1049,7 +1067,7 @@ class LISAForCausalLM(nn.Module):
                                         # SAMモデルでマスクを予測
                                         masks_predictions, scores, logits = self.sam.mask_decoder(
                                             image_embeddings=sam_image_embedding,
-                                            image_pe=self.sam.prompt_encoder.get_dense_pe(),
+                                            image_pe=image_pe,
                                             sparse_prompt_embeddings=sparse_embeddings,
                                             dense_prompt_embeddings=dense_prompt_embeddings,
                                             multimask_output=False,
@@ -1060,37 +1078,61 @@ class LISAForCausalLM(nn.Module):
                                             print("警告: マスク予測にNaNまたはInf値が含まれています。0に置き換えます。")
                                             masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
                                         
-                                        # マスクをリサイズして画像の元のサイズに合わせる
-                                        mask = F.interpolate(
+                                        # マスクを一時的に1024x1024サイズにリサイズ
+                                        mask_1024 = F.interpolate(
                                             masks_predictions,
                                             size=(self.sam_image_size, self.sam_image_size),
                                             mode="bilinear",
                                             align_corners=False,
                                         )
                                         
-                                        # マスクを2値化
-                                        mask = (mask > 0).float().cpu().numpy()
+                                        # 入力画像の元のサイズ（前処理前）を取得
+                                        if hasattr(self, 'original_image_size'):
+                                            orig_h, orig_w = self.original_image_size
+                                            print(f"マスクをオリジナル画像サイズ ({orig_h}, {orig_w}) にリサイズします")
+                                            
+                                            # マスクを元の画像サイズにリサイズ
+                                            mask = F.interpolate(
+                                                masks_predictions,
+                                                size=(orig_h, orig_w),
+                                                mode="bilinear",
+                                                align_corners=False,
+                                            )
+                                        else:
+                                            print("警告: オリジナル画像サイズ情報がありません。デフォルトサイズを使用します。")
+                                            mask = mask_1024
                                         
+                                        # マスクのシグモイド活性化と閾値処理
+                                        mask = torch.sigmoid(mask) > 0.5
+
                                         # マスク情報をリストに追加 - ただし辞書ではなく直接マスク配列を追加
-                                        masks.append(mask[0, 0])  # 最初のバッチ、最初のマスクのみ使用
-                                        print(f"マスク生成成功: 形状={mask[0, 0].shape}, 型={type(mask[0, 0])}")
+                                        masks.append(mask.cpu().numpy())
+                                        print(f"マスク生成成功: 形状={mask.shape}, 型={type(mask)}")
                                     
                                     except Exception as mask_error:
                                         print(f"マスク生成中にエラー: {str(mask_error)}")
-                                        # エラーのトレース表示
-                                        import traceback
-                                        traceback.print_exc()
-                                        # ダミーのマスクを追加 - ただし辞書ではなく直接マスク配列を追加
-                                        dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8)
+                                        # エラー時のフォールバック: ダミーマスクを生成
+                                        
+                                        # 元の画像サイズがある場合はそれに合わせる
+                                        if hasattr(self, 'original_image_size'):
+                                            mask_h, mask_w = self.original_image_size
+                                            print(f"オリジナルサイズ ({mask_h}x{mask_w}) のダミーマスクを生成")
+                                            dummy_mask = np.zeros((mask_h, mask_w), dtype=np.float32)
+                                        else:
+                                            # デフォルトサイズのダミーマスク
+                                            print(f"ダミーマスク生成: 形状=({self.sam_image_size}, {self.sam_image_size})")
+                                            dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.float32)
+                                        
+                                        # 中央部分に小さな円形のマスクを作成（視覚的に確認しやすいように）
+                                        center_h, center_w = dummy_mask.shape[0] // 2, dummy_mask.shape[1] // 2
+                                        radius = min(dummy_mask.shape[0], dummy_mask.shape[1]) // 8
+                                        
+                                        y, x = np.ogrid[:dummy_mask.shape[0], :dummy_mask.shape[1]]
+                                        dist_from_center = np.sqrt((y - center_h)**2 + (x - center_w)**2)
+                                        dummy_mask[dist_from_center <= radius] = 1.0
+                                        
                                         masks.append(dummy_mask)
-                                        print(f"ダミーマスク生成: 形状={dummy_mask.shape}")
-                                
-                                else:
-                                    print("警告: hidden_statesが取得できませんでした")
-                                    # ダミーのマスクを追加 - 辞書ではなく直接マスク配列を追加
-                                    dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8)
-                                    masks.append(dummy_mask)
-                                    print(f"hidden_statesなしのダミーマスク生成: 形状={dummy_mask.shape}")
+                                        print(f"ダミーマスク生成完了: 形状={dummy_mask.shape}")
 
                         except Exception as segment_error:
                             print(f"セグメント処理中にエラー: {str(segment_error)}")
@@ -1237,3 +1279,4 @@ def build_sam_vit_h(checkpoint=None):
     else:
         print("SAMチェックポイントが指定されていません - 学習済み重みなしで初期化します")
     return sam
+

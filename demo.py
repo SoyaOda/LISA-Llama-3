@@ -235,6 +235,17 @@ def visualize_results(image, masks, text, output_path):
             # マスクの形状を表示
             print(f"処理中のマスク形状: {mask.shape}, 型: {type(mask)}")
             
+            # 画像とマスクのサイズが一致しない場合はリサイズ
+            image_array = np.array(image)
+            img_h, img_w = image_array.shape[:2]
+            mask_h, mask_w = mask.shape[:2]
+            
+            if mask_h != img_h or mask_w != img_w:
+                print(f"マスクサイズ ({mask_h}x{mask_w}) を画像サイズ ({img_h}x{img_w}) に合わせてリサイズします")
+                import cv2
+                mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+                mask = (mask > 0.5).astype(np.float32)  # 閾値を適用して2値化
+            
             # Create a blended visualization
             vis_image = np.array(image).copy()
             mask_colored = np.zeros_like(vis_image, dtype=np.uint8)
@@ -249,21 +260,19 @@ def visualize_results(image, masks, text, output_path):
             vis_image = (1 - alpha) * vis_image + alpha * mask_colored
             vis_image = vis_image.astype(np.uint8)
             
-            # Display
-            axs[i + 1].imshow(vis_image)
-            axs[i + 1].set_title(f"Segmentation Mask {i+1}")
-            axs[i + 1].axis("off")
+            # Display blended image
+            axs[i+1].imshow(vis_image)
+            axs[i+1].set_title(f"Segmentation Mask {i+1}")
+            axs[i+1].axis("off")
     
-    # Save figure
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    # Add text below the visualization if available
+    if text:
+        plt.figtext(0.5, 0.01, text, ha="center", fontsize=12, wrap=True)
+    
+    # Save and close
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, bbox_inches="tight")
     plt.close()
-    
-    # Save text output
-    text_path = output_path.replace(".png", ".txt")
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(text)
 
 
 def main(args):
