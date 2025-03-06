@@ -425,7 +425,11 @@ class LISAForCausalLM(nn.Module):
         if not hasattr(self, "sam_image_size"):
             self.sam_image_size = 1024
             print(f"sam_image_sizeを{self.sam_image_size}に設定しました")
-            
+        
+        # 出力画像サイズも設定（セグメンテーション出力用）
+        self.image_size = self.sam_image_size
+        print(f"セグメンテーション出力のimage_sizeを{self.image_size}に設定しました")
+        
         # モデルのLLM次元を取得
         print("LLMの隠れ層次元を取得します...")
         try:
@@ -985,8 +989,10 @@ class LISAForCausalLM(nn.Module):
                                     except Exception as cpu_error:
                                         print(f"CPUでの処理も失敗しました: {str(cpu_error)}")
                                         # ダミーの隠れ状態とマスク情報を返し、次のトークンへ
+                                        # image_size属性がない場合のためのフォールバック
+                                        img_size = getattr(self, "image_size", 1024)
                                         masks.append({
-                                            "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                            "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
                                             "area": 0,
                                             "predicted_iou": 0.0,
                                             "stability_score": 0.0,
@@ -1005,8 +1011,11 @@ class LISAForCausalLM(nn.Module):
                                     # SAMの予測に使用する形式にプロジェクション
                                     prompt_embedding = self.seg_projection(seg_hidden_state)
                                     
-                                    # データタイプをfloat32に変換（SAMの要件に合わせる）
-                                    prompt_embedding = prompt_embedding.float()
+                                    # GPUのデータ型に合わせる（Half精度で動作している場合はHalfに合わせる）
+                                    device_dtype = next(self.sam.parameters()).dtype
+                                    prompt_embedding = prompt_embedding.to(dtype=device_dtype)
+                                    
+                                    print(f"プロンプト埋め込みのデータ型: {prompt_embedding.dtype}, SAMモデルのデータ型: {device_dtype}")
                                     
                                     # SAMへの入力を準備
                                     # 画像特徴マップがdeviceと一致していることを確認
@@ -1028,9 +1037,11 @@ class LISAForCausalLM(nn.Module):
                                             masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
                                         
                                         # マスクをリサイズして画像の元のサイズに合わせる
+                                        # image_size属性がない場合のためのフォールバック
+                                        img_size = getattr(self, "image_size", 1024)
                                         mask = F.interpolate(
                                             masks_predictions,
-                                            size=(self.image_size, self.image_size),
+                                            size=(img_size, img_size),
                                             mode="bilinear",
                                             align_corners=False,
                                         )
@@ -1060,8 +1071,10 @@ class LISAForCausalLM(nn.Module):
                                 else:
                                     print(
                                         "警告: hidden_statesが取得できませんでした")
+                                    # image_size属性がない場合のためのフォールバック
+                                    img_size = getattr(self, "image_size", 1024)
                                     masks.append({
-                                        "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                        "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
                                         "area": 0,
                                         "predicted_iou": 0.0,
                                         "stability_score": 0.0,
@@ -1070,8 +1083,10 @@ class LISAForCausalLM(nn.Module):
                         
                         except Exception as seg_error:
                             print(f"セグメンテーショントークン処理中にエラー: {str(seg_error)}")
+                            # image_size属性がない場合のためのフォールバック
+                            img_size = getattr(self, "image_size", 1024)
                             masks.append({
-                                "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                "segmentation": np.zeros((img_size, img_size), dtype=np.uint8),
                                 "area": 0,
                                 "predicted_iou": 0.0,
                                 "stability_score": 0.0,
@@ -1080,6 +1095,9 @@ class LISAForCausalLM(nn.Module):
                             
                 except Exception as token_error:
                     print(f"トークン処理中にエラー: {str(token_error)}")
+                    # エラーの詳細を表示
+                    import traceback
+                    traceback.print_exc()
                     masks = []  # 空のマスクリスト
                     
                 # 最終テキストを取得（特殊トークンを除去）
