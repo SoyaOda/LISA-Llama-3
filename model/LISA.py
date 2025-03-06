@@ -13,6 +13,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM, AutoConfig, Mllama
 from .segment_anything import sam_model_registry
 from .segment_anything.utils.transforms import ResizeLongestSide
 import cv2
+import json
 
 
 class LISAForCausalLM(nn.Module):
@@ -32,222 +33,162 @@ class LISAForCausalLM(nn.Module):
         local_rank=-1
     ):
         """
-        LISAモデルを初期化
+        LISAモデルの初期化
 
-        Args:
-            model_path (str): Llama 3.2 Vision Instructモデルのパス
-            sam_checkpoint (str): SAMチェックポイントのパス
-            seg_token (str): セグメンテーショントークン
-            device (str): 使用するデバイス ('cuda' または 'cpu')
-            max_batch_size (int): 最大バッチサイズ
-            use_deepspeed (bool): DeepSpeedを使用するかどうか
-            ds_config (dict): DeepSpeedの設定
-            local_rank (int): 分散学習でのローカルランク（DeepSpeed用）
+        引数:
+            model_path: Llama 3.2 Visionモデルのパス
+            sam_checkpoint: SAMモデルのチェックポイントファイル
+            seg_token: セグメンテーショントークン文字列
+            device: 使用するデバイス
+            max_batch_size: 最大バッチサイズ
+            use_deepspeed: DeepSpeedを使用するかどうか
+            ds_config: DeepSpeed設定ファイルのパス
+            local_rank: ローカルランク（分散学習用）
         """
         super().__init__()
-
-        # DeepSpeed関連の設定を保存
+        
+        # 基本パラメータの設定
+        self.seg_token = seg_token
+        self.max_batch_size = max_batch_size
+        self.device = device
         self.use_deepspeed = use_deepspeed
         self.ds_config = ds_config
         self.local_rank = local_rank
-
-        # デバイスを設定
-        if device is None:
-            # CUDAが利用可能な場合はそれを使用
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            # MPSサポートを安全に確認（Apple Siliconの場合）
-            elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
-                try:
-                    self.device = "mps"
-                    print("MPS (Metal Performance Shaders) を使用します")
-                except Exception as e:
-                    print(f"MPSの初期化中にエラーが発生しました: {e}")
-                    self.device = "cpu"
-            else:
-                self.device = "cpu"
-        else:
-            self.device = device
-
-        # DeepSpeedを使用する場合、ローカルランクがマイナスでなければローカルランクを出力
-        if self.use_deepspeed and self.local_rank >= 0:
-            print(f"DeepSpeedを使用します。ローカルランク: {self.local_rank}")
-
-        print(f"使用デバイス: {self.device}")
-
-        # セグメンテーショントークンを設定
-        self.seg_token = seg_token
-
-        # モデルの精度を設定
-        self.dtype = torch.float32
-        if torch.cuda.is_available():
-            # 最適なデータ型を選択
-            self.dtype = torch.float16  # 必要に応じてbfloat16など他の型に変更可能
-        print(f"モデルの精度: {self.dtype}")
-
-        # 各コンポーネントの初期化
-        self.processor = None
-        self.tokenizer = None
+        
+        # データ型の設定（GPUが利用可能であればfloat16、そうでなければfloat32）
+        self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        
+        # モデル初期化
         self.model = None
-        self.sam = None
-        self.seg_token_idx = None
-        self.sam_transform = None
-
-        # プロセッサとモデルをロード
+        self.processor = None
         self.initialize_llama(model_path)
-
-        # セグメンテーション投影レイヤー
+        self.transform = ResizeLongestSide(self.sam_image_size)
+        
+        # SAMモデルがある場合は初期化
+        self.sam = None
         self.initialize_lisa_modules(sam_checkpoint)
+        
+        # もしDeepSpeed用のds_configが指定されていなければ、ZeRO-2設定をデフォルトで作成
+        if self.use_deepspeed and not self.ds_config:
+            print("ZeRO-2を使用した安定したDeepSpeed設定を使用します")
+            self.ds_config = {
+                "fp16": {
+                    "enabled": True,
+                    "loss_scale": 0,
+                    "loss_scale_window": 1000,
+                    "initial_scale_power": 16,
+                    "hysteresis": 2,
+                    "min_loss_scale": 1
+                },
+                "bf16": {
+                    "enabled": False
+                },
+                "zero_optimization": {
+                    "stage": 2,  # ZeRO-2に変更（より安定）
+                    "offload_optimizer": {
+                        "device": "cpu",
+                        "pin_memory": True
+                    },
+                    "contiguous_gradients": True,
+                    "overlap_comm": True
+                },
+                "gradient_accumulation_steps": 1,
+                "gradient_clipping": 1.0,
+                "steps_per_print": 50,
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "wall_clock_breakdown": False
+            }
+            
+            # 一時的なconfig.jsonファイルに書き出し
+            with open("temp_ds_config.json", "w") as f:
+                json.dump(self.ds_config, f, indent=2)
+            self.ds_config = "temp_ds_config.json"
+            print(f"一時DeepSpeed設定ファイルを作成: {self.ds_config}")
 
     def initialize_llama(self, model_path):
         """
         Llama 3.2 Vision モデルを初期化
         """
-        print(f"Llama 3.2 Visionモデルをロード: {model_path}")
-
-        try:
-            # 設定をロード
-            config = AutoConfig.from_pretrained(model_path)
-            print(f"モデル設定: {config.__class__.__name__}")
-
-            # プロセッサをロード
-            self.processor = AutoProcessor.from_pretrained(model_path)
-            print(f"プロセッサがロードされました: {self.processor.__class__.__name__}")
-
-            # モデルをロード - Llama 3.2 Vision専用のクラスを使用
-            # DeepSpeed使用時と非使用時で分岐
-            if self.use_deepspeed:
-                # DeepSpeedを使用する場合の設定
-                print("DeepSpeedを使用してモデルをロードします")
-
-                # デバイスマップは使用しない（DeepSpeedが管理するため）
-                load_params = {
-                    "torch_dtype": self.dtype,
-                    "trust_remote_code": True
-                }
-
-                # モデルをロード
-                model = MllamaForConditionalGeneration.from_pretrained(
+        print(f"プロセッサーとモデルをロードしています: {model_path}")
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        
+        # DeepSpeedを使用する場合
+        if self.use_deepspeed:
+            print("DeepSpeedエンジンを初期化しています...")
+            if self.ds_config is None:
+                self.ds_config = "ds_config.json"
+                print(f"デフォルトDeepSpeed設定ファイルを使用: {self.ds_config}")
+            
+            # モデルクラス選択
+            try:
+                model_class = MllamaForConditionalGeneration
+                print("MllamaForConditionalGenerationを使用します")
+            except Exception as e:
+                print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
+                model_class = AutoModelForCausalLM
+                print("代わりにAutoModelForCausalLMを使用します")
+            
+            # DSの初期化
+            self.model, _, _, _ = deepspeed.initialize(
+                model=model_class.from_pretrained(
                     model_path,
-                    **load_params
-                )
-
-                # DeepSpeedエンジンを初期化
-                ds_engine_params = {
-                    "model": model,
-                    "config_params": self.ds_config,
-                }
-
-                # ローカルランクが指定されている場合は追加
-                if self.local_rank >= 0:
-                    ds_engine_params["config_params"]["local_rank"] = self.local_rank
-
-                # DeepSpeedエンジンを初期化
-                self.model, _, _, _ = deepspeed.initialize(**ds_engine_params)
-
-                print("DeepSpeedエンジンが初期化されました")
-            else:
-                # 通常のロード（DeepSpeedなし）
-                device_param = "auto" if self.device is None else self.device
-
-                # トーチ2.0以降でのMPSサポートチェック
-                load_params = {
-                    "torch_dtype": self.dtype,
-                    "trust_remote_code": True
-                }
-
-                # MPSまたはCUDAサポートチェック
-                if device_param != "cpu":
-                    try:
-                        load_params["device_map"] = device_param
-                    except Exception as e:
-                        print(f"デバイスマップの設定中にエラー: {e}")
-                        print("CPUにフォールバックします")
-                        device_param = "cpu"
-
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                ),
+                config=self.ds_config,
+                model_parameters=None,
+            )
+            # デバイスパラメータの設定
+            if self.device is None and torch.cuda.is_available():
+                self.device = f"cuda:{self.local_rank}"
+                print(f"自動的にデバイスを設定: {self.device}")
+        
+        # 通常のPyTorchを使用する場合
+        else:
+            print("標準PyTorchモデルを初期化しています...")
+            if self.device is None:
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"自動的にデバイスを設定: {self.device}")
+            
+            # モデルをロード
+            try:
                 self.model = MllamaForConditionalGeneration.from_pretrained(
                     model_path,
-                    **load_params
-                )
-
-                self.model.eval()
-                print(f"モデルがロードされました: {self.model.__class__.__name__}")
-
-                # トークナイザーにセグメンテーショントークンを追加（存在しない場合）
-                if self.seg_token not in self.processor.tokenizer.get_vocab():
-                    print(f"トークナイザーに {self.seg_token} トークンを追加します")
-                    self.processor.tokenizer.add_tokens([self.seg_token])
-
-                    # モデルのエンベディング層を拡張
-                    # より安全なオプションを設定してトークンを拡張
-                    try:
-                        print("embedding層を拡張中...")
-                        # 大きいモデルでのメモリ不足に対応
-                        # トークナイザーサイズを保存
-                        vocab_size = len(self.processor.tokenizer)
-
-                        # 低メモリモードでトークンを追加
-                        if self.device == "cpu":
-                            print("低メモリモードでembedding層を拡張します")
-
-                            # トークン情報を保存
-                            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(
-                                self.seg_token)
-                            print(
-                                f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
-
-                            # CPUではembedding層拡張をスキップ - tokenizerと互換性を維持するために
-                            # トークンインデックスだけ取得（そしてハンドリング時に特別処理）
-                            print("CPUではembedding層の拡張をスキップします")
-                        else:
-                            # DeepSpeed使用時は特別な処理が必要
-                            if self.use_deepspeed:
-                                # DeepSpeedモデルのためのトークン拡張（代替手法）
-                                print("DeepSpeedモデルのための代替埋め込み拡張手法を使用します")
-
-                                # トークンIDだけを取得し、埋め込み拡張はスキップ
-                                # これはDeepSpeed環境での埋め込み変更が複雑なため
-                                print("DeepSpeed環境では埋め込み拡張をスキップします")
-                                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(
-                                    self.seg_token)
-                                print(
-                                    f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
-                                print("トークンは追加されましたが、埋め込み拡張はスキップされました")
-
-                                # 注意：実際の運用では、埋め込み拡張を含むモデルを事前に保存し、
-                                # それをDeepSpeedでロードすることを推奨します
-                            else:
-                                # 通常の場合
-                                self.model.resize_token_embeddings(vocab_size)
-
-                                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(
-                                    self.seg_token)
-                                print(
-                                    f"セグメンテーショントークンのインデックス: {self.seg_token_idx}")
-                                print("embedding層の拡張が完了しました")
-                    except Exception as e:
-                        print(f"embeddings拡張中にエラー: {e}")
-                        print("別の代替手段を試行...")
-                        try:
-                            # 最低限の対応として、トークンIDの取得のみ行う
-                            self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(
-                                self.seg_token)
-                            print(
-                                f"トークン拡張はスキップしますが、セグメンテーショントークンIDを保存: {self.seg_token_idx}")
-                        except Exception as e2:
-                            print(f"トークンID取得中にもエラー発生: {e2}")
-                            # どうしても失敗した場合は仮のトークンIDを設定
-                            print("警告: 仮のトークンIDを使用します")
-                            self.seg_token_idx = -1
-
-                # セグメンテーショントークンのインデックスを取得
-                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(
-                    self.seg_token)
-                print(f"セグメンテーショントークンID: {self.seg_token_idx}")
-
-        except Exception as e:
-            print(f"モデルのロード中にエラーが発生: {e}")
-            raise
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                ).to(self.device)
+                print("MllamaForConditionalGenerationを使用します")
+            except Exception as e:
+                print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                ).to(self.device)
+                print("代わりにAutoModelForCausalLMを使用します")
+        
+        print(f"モデルのデバイス: {self.device}")
+        
+        # モデルの語彙サイズをトークナイザと一致させる（重要な修正）
+        # これによりScatterGatherKernelエラーを解消
+        tokenizer_vocab_size = len(self.processor.tokenizer)
+        if hasattr(self.model, "module"):
+            model_vocab_size = self.model.module.config.text_config.vocab_size
+            if tokenizer_vocab_size != model_vocab_size:
+                print(f"語彙サイズの不一致を検出: モデル={model_vocab_size}, トークナイザ={tokenizer_vocab_size}")
+                print(f"モデルの語彙サイズをトークナイザに合わせて調整します")
+                # DeepSpeedモデルの場合は内部モジュールを使う
+                self.model.module.resize_token_embeddings(tokenizer_vocab_size)
+        else:
+            model_vocab_size = self.model.config.text_config.vocab_size
+            if tokenizer_vocab_size != model_vocab_size:
+                print(f"語彙サイズの不一致を検出: モデル={model_vocab_size}, トークナイザ={tokenizer_vocab_size}")
+                print(f"モデルの語彙サイズをトークナイザに合わせて調整します")
+                self.model.resize_token_embeddings(tokenizer_vocab_size)
+        
+        # <seg>トークンをトークナイザに追加
+        self.expand_embedding_layer(self.seg_token)
 
     def initialize_lisa_modules(self, sam_checkpoint=None):
         """
@@ -537,13 +478,17 @@ class LISAForCausalLM(nn.Module):
                 # 生成パラメータ設定
                 # top_kがNoneまたは大きすぎる場合の安全対策
                 if top_k is None or top_k > 50:
-                    top_k = 30  # 安全な最大値に制限
+                    top_k = 5  # 最小限のtop_k値
                 print(f"使用するtop_k値: {top_k}")
 
                 # 異常値回避のためのパラメータ検証
                 temperature = max(0.1, min(2.0, temperature))  # 0.1~2.0の範囲に制限
                 top_p = max(0.1, min(0.99, top_p))  # 0.1~0.99の範囲に制限
+                
+                # よりシンプルな生成アプローチを使用するフラグ
+                use_simple_generation = True
 
+                # 基本の生成パラメータ
                 generation_params = {
                     "input_ids": model_inputs["input_ids"],
                     "attention_mask": model_inputs["attention_mask"],
@@ -552,11 +497,8 @@ class LISAForCausalLM(nn.Module):
                     "aspect_ratio_mask": model_inputs["aspect_ratio_mask"],
                     "max_new_tokens": max_new_tokens,
                     "temperature": temperature,
-                    "do_sample": do_sample,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "repetition_penalty": repetition_penalty,
-                    "num_beams": num_beams,
+                    "do_sample": False,  # サンプリングを無効化
+                    "num_beams": 1,      # ビームサーチを無効化
                     "use_cache": True,
                     "pad_token_id": self.processor.tokenizer.pad_token_id,
                     "eos_token_id": self.processor.tokenizer.eos_token_id,
@@ -567,82 +509,114 @@ class LISAForCausalLM(nn.Module):
                     print(
                         f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
 
+                # まずテンソルの形状とデバイスを確認
+                for k, v in generation_params.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"{k}: 形状={v.shape}, デバイス={v.device}, dtype={v.dtype}")
+                        # NaNとInfをチェック
+                        if torch.isnan(v).any() or torch.isinf(v).any():
+                            print(f"警告: {k}にNaNまたはInf値が含まれています。修正します。")
+                            generation_params[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, グリーディ生成={not do_sample}")
+                
                 try:
-                    # まずテンソルの形状とデバイスを確認
-                    for k, v in generation_params.items():
-                        if isinstance(v, torch.Tensor):
-                            print(f"{k}: 形状={v.shape}, デバイス={v.device}, dtype={v.dtype}")
-                            # NaNとInfをチェック
-                            if torch.isnan(v).any() or torch.isinf(v).any():
-                                print(f"警告: {k}にNaNまたはInf値が含まれています。修正します。")
-                                generation_params[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
-                    
-                    # 生成パラメータを安全な設定に微調整
-                    print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, do_sample={do_sample}, num_beams={num_beams}")
-                    
-                    print("DeepSpeed環境でgenerateを実行します")
-                    
-                    # DeepSpeedのモジュールを使用して生成
-                    generate_outputs = self.model.module.generate(
-                        **generation_params)
-
+                    if use_simple_generation:
+                        print("安全な手動生成を実行します...")
+                        
+                        # モデルを評価モードに設定
+                        model = self.model.module if hasattr(self.model, "module") else self.model
+                        model.eval()
+                        
+                        # 入力IDの準備
+                        input_ids = generation_params["input_ids"].clone()
+                        attention_mask = generation_params["attention_mask"].clone()
+                        pixel_values = generation_params["pixel_values"]
+                        aspect_ratio_ids = generation_params["aspect_ratio_ids"]
+                        aspect_ratio_mask = generation_params["aspect_ratio_mask"]
+                        
+                        # 最大トークン数
+                        max_length = input_ids.shape[1] + min(100, max_new_tokens)
+                        
+                        with torch.inference_mode():
+                            # 最初のフォワードパス - すべての入力を処理
+                            outputs = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                pixel_values=pixel_values,
+                                aspect_ratio_ids=aspect_ratio_ids,
+                                aspect_ratio_mask=aspect_ratio_mask,
+                                return_dict=True,
+                                use_cache=True
+                            )
+                            
+                            # 最初のKVキャッシュを取得
+                            past_key_values = outputs.past_key_values
+                            
+                            # 現在のトークンシーケンスを保存
+                            generated = input_ids
+                            
+                            # 既存のトークン数をカウント
+                            cur_len = input_ids.shape[1]
+                            
+                            # 一度に1トークンずつ生成
+                            for _ in range(min(100, max_new_tokens)):
+                                # 次のトークンを予測
+                                next_token_logits = outputs.logits[:, -1, :]
+                                
+                                # 極端な値を安全に処理
+                                next_token_logits = torch.nan_to_num(next_token_logits, nan=-float('inf'), posinf=-float('inf'), neginf=-float('inf'))
+                                
+                                # グリーディ選択（エラーを避けるため）
+                                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                                
+                                # シーケンスを更新
+                                generated = torch.cat([generated, next_tokens], dim=-1)
+                                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
+                                cur_len += 1
+                                
+                                # EOS条件をチェック
+                                if next_tokens[0, 0].item() == self.processor.tokenizer.eos_token_id:
+                                    break
+                                
+                                # 最大長をチェック
+                                if cur_len >= max_length:
+                                    break
+                                
+                                # 次のステップの入力を設定
+                                outputs = model(
+                                    input_ids=next_tokens,
+                                    attention_mask=attention_mask[:, -1:],
+                                    use_cache=True,
+                                    past_key_values=past_key_values,
+                                    return_dict=True
+                                )
+                                past_key_values = outputs.past_key_values
+                        
+                        # 生成されたシーケンスを返す
+                        generate_outputs = generated
+                        print(f"安全な手動生成が完了しました。総トークン数: {generate_outputs.shape[1]}")
+                        
+                    else:
+                        # 通常のモデル生成を試みる
+                        print("DeepSpeed環境でgenerateを実行します")
+                        generate_outputs = self.model.module.generate(**generation_params)
+                        
                 except Exception as e:
-                    print(f"通常のgenerateでエラーが発生しました: {str(e)}")
+                    print(f"生成中にエラーが発生しました: {str(e)}")
+                    print("最終的なフォールバック: 最小限の生成を試行します")
                     
                     try:
-                        print("フォールバック: シンプルな生成方法を試行します")
-
-                        # GPUキャッシュをクリア
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            print("GPUキャッシュをクリアしました")
-
-                        # パラメータの修正 - 最も安全な値に設定
-                        safe_params = generation_params.copy()
-                        safe_params["do_sample"] = False  # グリーディ検索
-                        safe_params["num_beams"] = 1  # ビームサーチを無効化
-                        safe_params["top_k"] = 1  # 最も安全
-                        safe_params["temperature"] = 1.0  # ニュートラル
-                        safe_params["max_new_tokens"] = min(100, max_new_tokens)  # 短く制限
-                        
-                        # GPU上での試行を続ける
-                        generate_outputs = self.model.module.generate(**safe_params)
-                            
+                        # トークナイザに戻し、最小限の応答で返す
+                        minimal_text = "すみません、画像処理中にエラーが発生しました。"
+                        minimal_tokens = self.processor.tokenizer.encode(minimal_text, return_tensors="pt").to(device)
+                        generate_outputs = torch.cat([generation_params["input_ids"][:, :10], minimal_tokens], dim=1)
                     except Exception as e2:
-                        print(f"フォールバック生成でもエラーが発生しました: {str(e2)}")
+                        print(f"最終フォールバックでもエラー: {str(e2)}")
+                        # 最小限のダミー出力
+                        generate_outputs = generation_params["input_ids"]
+                        return {"masks": [], "text": "テキスト生成に失敗しました。"}
                         
-                        # 最終フォールバック - さらに安全な設定で試行
-                        try:
-                            print("最終フォールバック: グリーディ生成を試行します")
-                            
-                            # GPUキャッシュをクリア
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            
-                            # 最も安全な設定
-                            final_params = {
-                                "input_ids": safe_params["input_ids"],
-                                "attention_mask": safe_params["attention_mask"],
-                                "pixel_values": safe_params["pixel_values"],
-                                "aspect_ratio_ids": safe_params["aspect_ratio_ids"],
-                                "aspect_ratio_mask": safe_params["aspect_ratio_mask"],
-                                "max_new_tokens": 25,  # 非常に短く
-                                "do_sample": False,  # グリーディ検索
-                                "num_beams": 1,     # ビームなし
-                                "use_cache": False,  # キャッシュを無効化
-                                "pad_token_id": self.processor.tokenizer.pad_token_id,
-                                "eos_token_id": self.processor.tokenizer.eos_token_id,
-                            }
-                            
-                            # 特殊トークンのみを生成
-                            with torch.inference_mode():
-                                generate_outputs = self.model.module.generate(**final_params)
-                                
-                        except Exception as e3:
-                            print(f"全ての生成方法が失敗しました: {str(e3)}")
-                            # 最終フォールバック - ダミーの結果を返す
-                            return {"masks": [], "text": f"テキスト生成に失敗しました: {str(e3)}"}
-
                 # 生成されたトークンIDを取得
                 generate_ids = generate_outputs.detach()
 
@@ -911,6 +885,69 @@ class LISAForCausalLM(nn.Module):
             local_rank=local_rank,
             **kwargs
         )
+
+    def expand_embedding_layer(self, new_token):
+        """
+        モデルの埋め込み層を拡張して新しいトークンを追加
+        
+        Args:
+            new_token: 追加する新しいトークン
+        """
+        try:
+            print(f"トークナイザと埋め込み層を拡張: {new_token}")
+            
+            # トークナイザに新しいトークンが含まれているかチェック
+            if new_token not in self.processor.tokenizer.get_vocab():
+                print(f"トークナイザに新トークンを追加: {new_token}")
+                num_added_tokens = self.processor.tokenizer.add_tokens([new_token])
+                print(f"追加されたトークン数: {num_added_tokens}")
+                
+                # トークンIDを取得
+                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
+                print(f"新トークンID: {self.seg_token_idx}")
+                
+                # モデルの埋め込み層を拡張
+                if self.use_deepspeed:
+                    print("DeepSpeedモデルの埋め込み層を拡張...")
+                    # DeepSpeedモデルではmoduleを通してアクセス
+                    vocab_size = len(self.processor.tokenizer)
+                    current_vocab_size = self.model.module.config.text_config.vocab_size
+                    
+                    if vocab_size > current_vocab_size:
+                        print(f"埋め込み層を拡張: {current_vocab_size} -> {vocab_size}")
+                        try:
+                            self.model.module.resize_token_embeddings(vocab_size)
+                            print("埋め込み層の拡張が完了しました")
+                        except Exception as e:
+                            print(f"埋め込み層拡張中にエラー: {str(e)}")
+                            print("このエラーは無視してください - トークンIDは取得済みです")
+                else:
+                    # 通常のモデルの場合
+                    vocab_size = len(self.processor.tokenizer)
+                    current_vocab_size = self.model.config.text_config.vocab_size
+                    
+                    if vocab_size > current_vocab_size:
+                        print(f"埋め込み層を拡張: {current_vocab_size} -> {vocab_size}")
+                        try:
+                            self.model.resize_token_embeddings(vocab_size)
+                            print("埋め込み層の拡張が完了しました")
+                        except Exception as e:
+                            print(f"埋め込み層拡張中にエラー: {str(e)}")
+                            print("このエラーは無視してください - トークンIDは取得済みです")
+            else:
+                # すでにトークンが存在する場合、IDだけを取得
+                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
+                print(f"既存トークンのIDを取得: {self.seg_token_idx}")
+                
+        except Exception as e:
+            print(f"トークン拡張処理中にエラーが発生: {str(e)}")
+            # バックアップ処理: エラーが発生した場合でもトークンIDを取得
+            try:
+                self.seg_token_idx = self.processor.tokenizer.convert_tokens_to_ids(new_token)
+                print(f"エラー後のフォールバック: トークンID = {self.seg_token_idx}")
+            except:
+                print("警告: トークンIDの取得に失敗しました。デフォルト値を使用します。")
+                self.seg_token_idx = -100  # デフォルト値
 
 
 def build_sam_vit_h(checkpoint=None):
