@@ -775,8 +775,14 @@ class LISAForCausalLM(nn.Module):
                 generation_kwargs["num_beams"] = num_beams
                 print(f"ビームサーチを使用: ビーム数={num_beams}")
 
-            # 入力に合わせたメッセージ形式を作成
+            # チャットメッセージの構成
+            # Llama 3.2 Visionの最適なプロンプト形式を使用
+            # システムプロンプトを追加（品質向上用）
             messages = [
+                {
+                    "role": "system",
+                    "content": "あなたは有能なアシスタントです。画像の分析と説明を明確で詳細に行い、日本語で回答してください。"
+                },
                 {
                     "role": "user",
                     "content": [
@@ -787,11 +793,17 @@ class LISAForCausalLM(nn.Module):
             ]
             
             # メッセージからチャットテンプレートを適用
-            input_text = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors=None  # テキストを返す
-            )
+            try:
+                input_text = self.processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors=None  # テキストを返す
+                )
+            except Exception as template_error:
+                print(f"チャットテンプレート適用エラー: {template_error}")
+                # フォールバック：単純なテンプレート適用
+                input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                
             print(f"チャットテンプレート適用後: {input_text[:100]}...")
 
             try:
@@ -830,6 +842,27 @@ class LISAForCausalLM(nn.Module):
                 if torch.cuda.is_available() and device.type == 'cuda':
                     print(f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
 
+                # 生成パラメータをLlama 3.2 Visionの特性に最適化
+                generation_kwargs = {
+                    'do_sample': do_sample,
+                    'temperature': min(0.3, temperature),  # より低温の設定で決定的な生成
+                    'top_p': max(0.8, top_p),  # トップ確率を高めに設定
+                    'repetition_penalty': max(1.2, repetition_penalty),  # 繰り返しを抑制
+                    'max_new_tokens': max_new_tokens,
+                    'num_beams': num_beams,
+                    'use_cache': True,  # KVキャッシュを使用（高速化）
+                    'eos_token_id': self.processor.tokenizer.eos_token_id,  # 明示的に終了トークンを設定
+                    'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
+                    'early_stopping': True,  # 早期停止を有効化
+                }
+                
+                # 日本語プロンプトの場合、日本語出力を促進するパラメータを設定
+                if any(ord(c) > 127 for c in prompt):  # 非ASCII文字（日本語など）が含まれている
+                    print("日本語プロンプトを検出: 日本語生成パラメータを最適化")
+                    # 日本語生成に最適化されたパラメータ
+                    generation_kwargs['temperature'] = min(0.2, temperature)  # さらに低温
+                    generation_kwargs['top_p'] = max(0.92, top_p)  # 多様性維持
+
                 generate_ids = None
 
                 # DeepSpeedモデルの場合
@@ -845,6 +878,21 @@ class LISAForCausalLM(nn.Module):
                         **model_inputs,
                         **generation_kwargs
                     }
+                    
+                    # Llama 3.2 Visionに最適化した生成パラメータ
+                    # オプション：元の温度とtop_pを上書き
+                    if 'temperature' not in generation_kwargs:
+                        generate_inputs['temperature'] = 0.1  # 低温で決定的な生成
+                    if 'top_p' not in generation_kwargs:
+                        generate_inputs['top_p'] = 0.9  # トップ確率を高めに
+                    
+                    # RepetitionPenaltyを追加
+                    if 'repetition_penalty' not in generation_kwargs:
+                        generate_inputs['repetition_penalty'] = 1.5  # 繰り返しを避ける
+                        
+                    # デコード設定の最適化
+                    generate_inputs['bad_words_ids'] = None  # 生成を制限する単語なし
+                    generate_inputs['remove_invalid_values'] = True  # 無効な値を除去
                     
                     # 生成を実行
                     try:
@@ -904,9 +952,31 @@ class LISAForCausalLM(nn.Module):
                 
                 # 生成されたトークンをデコード
                 try:
+                    # トークン化された出力をテキストにデコード
+                    # skip_special_tokensを設定：特殊トークンを省略するが<seg>は保持
+                    special_tokens_to_skip = self.processor.tokenizer.all_special_tokens.copy()
+                    if self.seg_token in special_tokens_to_skip:
+                        special_tokens_to_skip.remove(self.seg_token)
+                    
+                    # デコード処理を最適化
                     generated_text = self.processor.tokenizer.batch_decode(
-                        generate_ids, skip_special_tokens=True
+                        generate_ids, 
+                        skip_special_tokens=False,  # 特殊トークンを保持
+                        clean_up_tokenization_spaces=True  # トークン化スペースをクリーンアップ
                     )[0]
+                    
+                    # ユーザーメッセージとアシスタントメッセージを検出し、アシスタント部分だけを取得
+                    # Llama 3.2 Visionのフォーマットに従う
+                    if "<|start_header_id|>assistant<|end_header_id|>" in generated_text:
+                        assistant_prefix = "<|start_header_id|>assistant<|end_header_id|>"
+                        assistant_start = generated_text.index(assistant_prefix) + len(assistant_prefix)
+                        # EOT_IDがあれば削除
+                        if "<|eot_id|>" in generated_text[assistant_start:]:
+                            assistant_end = generated_text.index("<|eot_id|>", assistant_start)
+                            generated_text = generated_text[assistant_start:assistant_end].strip()
+                        else:
+                            generated_text = generated_text[assistant_start:].strip()
+                    
                     print(f"生成テキスト (一部): {generated_text[:100]}...")
                 except Exception as decode_error:
                     print(f"テキストデコード中にエラー: {str(decode_error)}")
