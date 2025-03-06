@@ -73,63 +73,6 @@ class LISAForCausalLM(nn.Module):
         # SAMモデルがある場合は初期化
         self.sam = None
         self.initialize_lisa_modules(sam_checkpoint)
-        
-        # もしDeepSpeed用のds_configが指定されていなければ、ZeRO-2設定をデフォルトで作成
-        if self.use_deepspeed and not self.ds_config:
-            print("ZeRO-2を使用した安定したDeepSpeed設定を使用します")
-            
-            # world_sizeを取得（DeepSpeedの場合）
-            if dist.is_initialized():
-                world_size = dist.get_world_size()
-            else:
-                world_size = 1
-            
-            # マイクロバッチサイズ
-            micro_batch_size = 1
-            
-            # 勾配累積ステップ
-            grad_accum_steps = 1
-            
-            # 合計バッチサイズを計算（world_sizeに基づく）
-            train_batch_size = micro_batch_size * grad_accum_steps * world_size
-            
-            print(f"DeepSpeed設定: world_size={world_size}, micro_batch={micro_batch_size}, grad_accum={grad_accum_steps}")
-            print(f"計算された合計バッチサイズ: {train_batch_size}")
-            
-            self.ds_config = {
-                "fp16": {
-                    "enabled": True,
-                    "loss_scale": 0,
-                    "loss_scale_window": 1000,
-                    "initial_scale_power": 16,
-                    "hysteresis": 2,
-                    "min_loss_scale": 1
-                },
-                "bf16": {
-                    "enabled": False
-                },
-                "zero_optimization": {
-                    "stage": 2,  # ZeRO-2に変更（より安定）
-                    "offload_optimizer": {
-                        "device": "cpu",
-                        "pin_memory": True
-                    },
-                    "contiguous_gradients": True,
-                    "overlap_comm": True
-                },
-                "gradient_accumulation_steps": grad_accum_steps,
-                "gradient_clipping": 1.0,
-                "steps_per_print": 50,
-                "train_batch_size": train_batch_size,
-                "train_micro_batch_size_per_gpu": micro_batch_size,
-                "wall_clock_breakdown": False
-            }
-            
-            # 一時的なconfig.jsonファイルに書き出し
-            with open("temp_ds_config.json", "w") as f:
-                json.dump(self.ds_config, f, indent=2)
-            self.ds_config = "temp_ds_config.json"
-            print(f"一時DeepSpeed設定ファイルを作成: {self.ds_config}")
 
     def initialize_llama(self, model_path):
         """
@@ -150,23 +93,92 @@ class LISAForCausalLM(nn.Module):
         print(f"セグメンテーショントークンID: {self.seg_token_idx}")
         print(f"トークナイザの語彙サイズ: {len(self.processor.tokenizer)}")
         
-        # モデルクラスを選択
+        # 両方のモデルクラスを事前にインポート
+        from transformers import AutoModelForCausalLM
         try:
             from transformers import MllamaForConditionalGeneration
             model_class = MllamaForConditionalGeneration
             print("MllamaForConditionalGenerationを使用します")
         except Exception as e:
             print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
-            from transformers import AutoModelForCausalLM
             model_class = AutoModelForCausalLM
             print("代わりにAutoModelForCausalLMを使用します")
         
         # DeepSpeedを使用する場合
         if self.use_deepspeed:
             print("DeepSpeedエンジンを初期化しています...")
-            if self.ds_config is None:
-                self.ds_config = "ds_config.json"
-                print(f"デフォルトDeepSpeed設定ファイルを使用: {self.ds_config}")
+            
+            # world_sizeを取得（DeepSpeedの場合）
+            if dist.is_initialized():
+                world_size = dist.get_world_size()
+            else:
+                world_size = 1
+                
+            # マイクロバッチサイズとバッチサイズを設定
+            micro_batch_size = 1
+            grad_accum_steps = 1
+            total_batch_size = micro_batch_size * grad_accum_steps * world_size
+            
+            print(f"DeepSpeed設定: world_size={world_size}, micro_batch={micro_batch_size}, grad_accum={grad_accum_steps}")
+            print(f"計算された合計バッチサイズ: {total_batch_size}")
+            
+            # 設定ファイルの処理
+            ds_config_dict = None
+            
+            # 設定ファイルが指定されている場合は読み込む
+            if isinstance(self.ds_config, str) and os.path.exists(self.ds_config):
+                try:
+                    with open(self.ds_config, 'r') as f:
+                        ds_config_dict = json.load(f)
+                    print(f"既存のDeepSpeed設定ファイルを読み込みました: {self.ds_config}")
+                except Exception as e:
+                    print(f"設定ファイル読み込みエラー: {str(e)}")
+                    ds_config_dict = None
+            
+            # 設定ファイルが読み込めなかった場合はデフォルト設定を使用
+            if ds_config_dict is None:
+                ds_config_dict = {
+                    "fp16": {
+                        "enabled": True,
+                        "loss_scale": 0,
+                        "loss_scale_window": 1000,
+                        "initial_scale_power": 16,
+                        "hysteresis": 2,
+                        "min_loss_scale": 1
+                    },
+                    "bf16": {
+                        "enabled": False
+                    },
+                    "zero_optimization": {
+                        "stage": 2,
+                        "offload_optimizer": {
+                            "device": "cpu",
+                            "pin_memory": True
+                        },
+                        "contiguous_gradients": True,
+                        "overlap_comm": True
+                    },
+                    "gradient_accumulation_steps": grad_accum_steps,
+                    "gradient_clipping": 1.0,
+                    "steps_per_print": 50,
+                    "train_batch_size": total_batch_size,
+                    "train_micro_batch_size_per_gpu": micro_batch_size,
+                    "wall_clock_breakdown": False
+                }
+                print("デフォルトのDeepSpeed設定を使用します")
+            else:
+                # 既存の設定にworld_sizeに基づくバッチサイズを設定
+                ds_config_dict["train_batch_size"] = total_batch_size
+                ds_config_dict["train_micro_batch_size_per_gpu"] = micro_batch_size
+                print("既存の設定ファイルを修正しました")
+            
+            # 一時的な設定ファイルに書き出し
+            temp_config_path = "temp_ds_config.json"
+            with open(temp_config_path, "w") as f:
+                json.dump(ds_config_dict, f, indent=2)
+            
+            self.ds_config = temp_config_path
+            print(f"DeepSpeed設定ファイルを作成: {self.ds_config}")
             
             # モデルの初期化（DeepSpeed初期化前）
             print("モデルを一時的に初期化してトークナイザと同期します")
