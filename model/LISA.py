@@ -1128,7 +1128,7 @@ class LISAForCausalLM(nn.Module):
                                 
                                 # SAMモデルでマスクを予測
                                 try:
-                                    masks_predictions, scores, logits = self.sam.mask_decoder(
+                                    masks_predictions, iou_predictions = self.sam.mask_decoder(
                                         image_embeddings=sam_image_embedding,
                                         image_pe=image_pe,
                                         sparse_prompt_embeddings=sparse_embeddings,
