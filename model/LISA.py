@@ -324,72 +324,14 @@ class LISAForCausalLM(nn.Module):
                 
                 try:
                     # 入力埋め込み層のリサイズ
+                    print(f"トークナイザサイズに合わせてモデルをリサイズします: {new_vocab_size}")
                     self.model.resize_token_embeddings(new_vocab_size)
-                    print(f"入力埋め込み層をリサイズしました: {new_vocab_size}")
-                    
-                    # 出力埋め込み層の手動リサイズ
-                    if hasattr(self.model, "get_output_embeddings") and self.model.get_output_embeddings() is not None:
-                        old_embeddings = self.model.get_output_embeddings()
-                        print(f"出力埋め込み層を取得: {old_embeddings}")
-                        
-                        # 拡張された出力埋め込み層を作成
-                        old_num_tokens = old_embeddings.weight.shape[0]
-                        if old_num_tokens < new_vocab_size:
-                            print(f"出力埋め込み層をリサイズします: {old_num_tokens} -> {new_vocab_size}")
-                            
-                            # 新しい重みを作成
-                            old_weights = old_embeddings.weight.data
-                            new_weights = torch.zeros(
-                                (new_vocab_size, old_weights.shape[1]),
-                                dtype=old_weights.dtype,
-                                device=old_weights.device
-                            )
-                            new_weights[:old_num_tokens, :] = old_weights
-                            
-                            # 新しいトークン埋め込みを平均値で初期化
-                            if new_vocab_size > old_num_tokens:
-                                num_new_tokens = new_vocab_size - old_num_tokens
-                                mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
-                                new_weights[old_num_tokens:, :] = mean_weights
-                            
-                            # 出力埋め込み層の重みを更新
-                            old_embeddings.weight.data = new_weights
-                            print(f"出力埋め込み層のリサイズが完了しました: {new_weights.shape}")
-                    else:
-                        print("警告: 出力埋め込み層が見つからないか、アクセスできません")
-                        
-                        # text_modelにアクセスできるか確認
-                        if hasattr(self.model, "text_model"):
-                            print("text_model経由で埋め込み層にアクセスを試みます")
-                            if hasattr(self.model.text_model, "lm_head") and self.model.text_model.lm_head is not None:
-                                lm_head = self.model.text_model.lm_head
-                                old_num_tokens = lm_head.weight.shape[0]
-                                if old_num_tokens < new_vocab_size:
-                                    print(f"text_model.lm_headをリサイズします: {old_num_tokens} -> {new_vocab_size}")
-                                    # 同様のリサイズ処理...
-                                    old_weights = lm_head.weight.data
-                                    new_weights = torch.zeros(
-                                        (new_vocab_size, old_weights.shape[1]),
-                                        dtype=old_weights.dtype,
-                                        device=old_weights.device
-                                    )
-                                    new_weights[:old_num_tokens, :] = old_weights
-                                    
-                                    # 新しいトークン埋め込みを平均値で初期化
-                                    if new_vocab_size > old_num_tokens:
-                                        num_new_tokens = new_vocab_size - old_num_tokens
-                                        mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
-                                        new_weights[old_num_tokens:, :] = mean_weights
-                                    
-                                    # 出力埋め込み層の重みを更新
-                                    lm_head.weight.data = new_weights
-                                    print(f"text_model.lm_headのリサイズが完了しました: {new_weights.shape}")
-                except Exception as e:
-                    print(f"埋め込み層のリサイズ中にエラーが発生しました: {str(e)}")
+                    print(f"モデルを{self.device}に移動します")
+                    self.model = self.model.to(self.device)
+                except Exception as resize_error:
+                    print(f"埋め込み層のリサイズ中にエラーが発生しました: {str(resize_error)}")
                     print("警告: モデルは標準のトークナイザサイズのままです")
-                
-                # モデルをデバイスに移動
-                self.model = self.model.to(self.device)
+                    self.model = self.model.to(self.device)
             
             except Exception as e:
                 print(f"モデル初期化エラー: {str(e)}")
@@ -1037,12 +979,22 @@ class LISAForCausalLM(nn.Module):
                                         sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
                                         print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
                                         
+                                        # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
+                                        # [B, C, H, W]形式のゼロテンソルを作成
+                                        # 画像埋め込みから適切な形状を取得
+                                        b, c, h, w = sam_image_embedding.shape
+                                        dense_prompt_embeddings = torch.zeros(
+                                            (b, c, h, w), 
+                                            device=sam_image_embedding.device, 
+                                            dtype=sam_image_embedding.dtype
+                                        )
+                                        
                                         # SAMモデルでマスクを予測
                                         masks_predictions, scores, logits = self.sam.mask_decoder(
                                             image_embeddings=sam_image_embedding,
                                             image_pe=self.sam.prompt_encoder.get_dense_pe(),
                                             sparse_prompt_embeddings=sparse_embeddings,
-                                            dense_prompt_embeddings=None,
+                                            dense_prompt_embeddings=dense_prompt_embeddings,
                                             multimask_output=False,
                                         )
                                         
