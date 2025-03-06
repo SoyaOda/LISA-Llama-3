@@ -33,7 +33,8 @@ class LISAForCausalLM(nn.Module):
         use_deepspeed=False,
         ds_config=None,
         local_rank=-1,
-        image_size=1024  # image_sizeをコンストラクタの引数に追加
+        image_size=1024,  # image_sizeをコンストラクタの引数に追加
+        infer=True  # 推論モードかトレーニングモードかを指定するフラグ
     ):
         """
         LISAモデルの初期化
@@ -48,21 +49,36 @@ class LISAForCausalLM(nn.Module):
             ds_config: DeepSpeed設定ファイルのパス
             local_rank: ローカルランク（分散学習用）
             image_size: SAMの画像サイズと出力セグメンテーション画像サイズ (デフォルト: 1024)
+            infer: 推論モードかどうか (デフォルト: True)
         """
         super().__init__()
         
         # 基本パラメータの設定
         self.seg_token = seg_token
         self.max_batch_size = max_batch_size
-        self.device = device
         self.use_deepspeed = use_deepspeed
         self.ds_config = ds_config
         self.local_rank = local_rank
         self.sam_image_size = image_size  # sam_image_sizeを初期化
         self.transform = None
+        self.infer = infer  # 推論モードかどうかのフラグ
+        
+        # デバイスの設定
+        if device is None:
+            if torch.cuda.is_available():
+                if use_deepspeed and local_rank >= 0:
+                    self.device = f"cuda:{local_rank}"
+                else:
+                    self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
+        
+        print(f"モデルのデバイスを設定: {self.device}")
         
         # データ型の設定（GPUが利用可能であればfloat16、そうでなければfloat32）
-        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.torch_dtype = torch.float16 if "cuda" in self.device else torch.float32
         self.dtype = self.torch_dtype  # 別名
         
         # モデル初期化
@@ -111,15 +127,17 @@ class LISAForCausalLM(nn.Module):
             # world_sizeを取得（DeepSpeedの場合）
             if dist.is_initialized():
                 world_size = dist.get_world_size()
+                local_rank = dist.get_rank()
             else:
                 world_size = 1
+                local_rank = 0
                 
             # マイクロバッチサイズとバッチサイズを設定
             micro_batch_size = 1
             grad_accum_steps = 1
             total_batch_size = micro_batch_size * grad_accum_steps * world_size
             
-            print(f"DeepSpeed設定: world_size={world_size}, micro_batch={micro_batch_size}, grad_accum={grad_accum_steps}")
+            print(f"DeepSpeed設定: world_size={world_size}, local_rank={local_rank}, micro_batch={micro_batch_size}, grad_accum={grad_accum_steps}")
             print(f"計算された合計バッチサイズ: {total_batch_size}")
             
             # 設定ファイルの処理
@@ -137,43 +155,68 @@ class LISAForCausalLM(nn.Module):
             
             # 設定ファイルが読み込めなかった場合はデフォルト設定を使用
             if ds_config_dict is None:
-                ds_config_dict = {
-                    "fp16": {
-                        "enabled": True,
-                        "loss_scale": 0,
-                        "loss_scale_window": 1000,
-                        "initial_scale_power": 16,
-                        "hysteresis": 2,
-                        "min_loss_scale": 1
-                    },
-                    "bf16": {
-                        "enabled": False
-                    },
-                    "zero_optimization": {
-                        "stage": 2,
-                        "offload_optimizer": {
-                            "device": "cpu",
-                            "pin_memory": True
+                # 推論モード用の設定
+                if getattr(self, 'infer', True):  # デフォルトは推論モード
+                    print("推論モード用のDeepSpeed設定を使用します")
+                    ds_config_dict = {
+                        "fp16": {
+                            "enabled": True
                         },
-                        "contiguous_gradients": True,
-                        "overlap_comm": True
-                    },
-                    "gradient_accumulation_steps": grad_accum_steps,
-                    "gradient_clipping": 1.0,
-                    "steps_per_print": 50,
-                    "train_batch_size": total_batch_size,
-                    "train_micro_batch_size_per_gpu": micro_batch_size,
-                    "wall_clock_breakdown": False
-                }
+                        "bf16": {
+                            "enabled": False
+                        },
+                        "zero_optimization": {
+                            "stage": 0  # 推論時はステージ0を使用
+                        },
+                        "train_batch_size": total_batch_size,
+                        "train_micro_batch_size_per_gpu": micro_batch_size,
+                        "steps_per_print": 50,
+                        "wall_clock_breakdown": False
+                    }
+                else:
+                    # 学習モード用の設定
+                    print("学習モード用のDeepSpeed設定を使用します")
+                    ds_config_dict = {
+                        "fp16": {
+                            "enabled": True,
+                            "loss_scale": 0,
+                            "loss_scale_window": 1000,
+                            "initial_scale_power": 16,
+                            "hysteresis": 2,
+                            "min_loss_scale": 1
+                        },
+                        "bf16": {
+                            "enabled": False
+                        },
+                        "zero_optimization": {
+                            "stage": 2,
+                            "offload_optimizer": {
+                                "device": "cpu",
+                                "pin_memory": True
+                            },
+                            "contiguous_gradients": True,
+                            "overlap_comm": True
+                        },
+                        "gradient_accumulation_steps": grad_accum_steps,
+                        "gradient_clipping": 1.0,
+                        "steps_per_print": 50,
+                        "train_batch_size": total_batch_size,
+                        "train_micro_batch_size_per_gpu": micro_batch_size,
+                        "wall_clock_breakdown": False
+                    }
                 print("デフォルトのDeepSpeed設定を使用します")
             else:
                 # 既存の設定にworld_sizeに基づくバッチサイズを設定
                 ds_config_dict["train_batch_size"] = total_batch_size
                 ds_config_dict["train_micro_batch_size_per_gpu"] = micro_batch_size
+                # 推論モードの場合はZeRO-stageを0に設定
+                if getattr(self, 'infer', True) and "zero_optimization" in ds_config_dict:
+                    ds_config_dict["zero_optimization"]["stage"] = 0
+                    print("推論モード用にZeRO-stageを0に設定しました")
                 print("既存の設定ファイルを修正しました")
             
-            # 一時的な設定ファイルに書き出し
-            temp_config_path = "temp_ds_config.json"
+            # プロセス固有の一時的な設定ファイルに書き出し
+            temp_config_path = f"temp_ds_config_rank{local_rank}.json"
             with open(temp_config_path, "w") as f:
                 json.dump(ds_config_dict, f, indent=2)
             
@@ -233,7 +276,8 @@ class LISAForCausalLM(nn.Module):
             
             # 一時モデルの状態をチェックポイントとして保存
             print("リサイズしたモデルを一時チェックポイントとして保存します")
-            temp_save_dir = "./temp_resized_model"
+            # プロセス固有の一時ディレクトリを使用
+            temp_save_dir = f"./temp_resized_model_rank{local_rank}"
             os.makedirs(temp_save_dir, exist_ok=True)
             temp_model.save_pretrained(temp_save_dir)
             del temp_model
@@ -256,14 +300,31 @@ class LISAForCausalLM(nn.Module):
                         "ignore_mismatched_sizes": True,
                     }
                 
-                self.model, _, _, _ = deepspeed.initialize(
-                    model=model_class.from_pretrained(
-                        temp_save_dir,
-                        **model_kwargs
-                    ),
-                    config=self.ds_config,
-                    model_parameters=None,
+                # 推論時用のパラメータを追加：オプティマイザとして空のダミーオプティマイザを提供
+                model = model_class.from_pretrained(
+                    temp_save_dir,
+                    **model_kwargs
                 )
+                
+                # 推論モードの場合はZeROなしで初期化
+                if getattr(self, 'infer', True):
+                    print("推論モードでDeepSpeedを初期化します")
+                    self.model, _, _, _ = deepspeed.initialize(
+                        model=model,
+                        config=self.ds_config,
+                        model_parameters=None
+                    )
+                else:
+                    # 学習モードの場合はダミーオプティマイザを使用
+                    print("学習モードでDeepSpeedを初期化します（ダミーオプティマイザ）")
+                    dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+                    self.model, _, _, _ = deepspeed.initialize(
+                        model=model,
+                        optimizer=dummy_optimizer,
+                        config=self.ds_config,
+                        model_parameters=None
+                    )
+                    
                 print("DeepSpeedの初期化が成功しました")
             except Exception as e:
                 print(f"DeepSpeed初期化エラー: {str(e)}")
@@ -278,6 +339,9 @@ class LISAForCausalLM(nn.Module):
             
             # 一時チェックポイントを削除
             try:
+                # 他のプロセスが同時にアクセスするのを防ぐためにバリアを追加（分散環境の場合）
+                if dist.is_initialized():
+                    dist.barrier()
                 shutil.rmtree(temp_save_dir, ignore_errors=True)
                 print("一時モデルチェックポイントを削除しました")
             except Exception as e:
@@ -607,16 +671,17 @@ class LISAForCausalLM(nn.Module):
             raise e
 
     def generate_segmentation(
-    self,
-    image,
-    prompt,
-    max_new_tokens=1024,
-    top_p=0.95,
-    temperature=0.1,
-    top_k=None,
-    num_beams=1,
-    repetition_penalty=1.0,
-     do_sample=True):
+        self,
+        image,
+        prompt,
+        max_new_tokens=1024,
+        top_p=0.95,
+        temperature=0.1,
+        top_k=None,
+        num_beams=1,
+        repetition_penalty=1.0,
+        do_sample=True
+    ):
         """
         画像とプロンプトからセグメンテーションと説明テキストを生成します。
 
@@ -634,9 +699,6 @@ class LISAForCausalLM(nn.Module):
 
         def check_image(img):
             """画像が正しい形式かチェックし、必要なら変換する"""
-            from PIL import Image
-            import numpy as np
-
             if isinstance(img, str):
                 # 画像パスの場合はロード
                 return Image.open(img).convert('RGB')
@@ -656,37 +718,83 @@ class LISAForCausalLM(nn.Module):
 
         try:
             # モデルのデバイスを取得
-            device = next(self.model.parameters()).device
-            print(f"モデルのデバイス: {device}")
-
-            # SAMで使用する画像処理
-            try:
-                # 画像が有効な形式かチェック
-                image_pil = check_image(image)
-
-                # SAMモデル用の画像埋め込みを生成
-                sam_image_embedding = self.preprocess_sam_image(image_pil)
-                print(f"SAM画像埋め込みのシェイプ: {sam_image_embedding.shape}")
-
-                # 入力に合わせたメッセージ形式を作成
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": prompt}
-                        ]
-                    }
-                ]
+            if self.use_deepspeed:
+                # DeepSpeedモデルの場合、moduleからデバイスを取得
+                if hasattr(self.model, 'module'):
+                    device = next(self.model.module.parameters()).device
+                else:
+                    device = next(self.model.parameters()).device
+            else:
+                # 通常のモデルの場合
+                device = next(self.model.parameters()).device
                 
-                # メッセージからチャットテンプレートを適用
-                input_text = self.processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_tensors=None  # テキストを返す
-                )
-                print(f"チャットテンプレート適用後: {input_text[:100]}...")
+            # デバイスがCPUの場合、self.deviceが設定されていればそれを使用
+            if device.type == 'cpu' and 'cuda' in self.device:
+                print(f"警告: モデルがCPUに配置されています。{self.device}に移動します。")
+                device = torch.device(self.device)
+                
+            print(f"デバイス: {device}")
+            
+            # 現在のGPUメモリ使用状況を表示
+            if device.type == 'cuda':
+                print(f"GPUメモリ使用状況（推論前）: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
+            
+            # モデルのデバイスが自身のデバイス属性と一致するか確認
+            print(f"モデルのデバイス: {device if device else self.device}")
+            
+            # SAMで使用する画像処理
+            # 画像が有効な形式かチェック
+            image_pil = check_image(image)
 
+            # SAMモデル用の画像埋め込みを生成
+            sam_image_embedding = self.preprocess_sam_image(image_pil)
+            print(f"SAM画像埋め込みのシェイプ: {sam_image_embedding.shape}")
+
+            # サンプリングパラメータの準備
+            generation_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "repetition_penalty": repetition_penalty,
+                "do_sample": do_sample,
+            }
+            
+            # 温度パラメータを設定（0より大きい場合のみ）
+            if temperature is not None and temperature > 0:
+                generation_kwargs["temperature"] = temperature
+            
+            # top_pパラメータを設定
+            if top_p is not None and 0 < top_p <= 1.0:
+                generation_kwargs["top_p"] = top_p
+            
+            # top_kパラメータを設定
+            if top_k is not None and top_k > 0:
+                generation_kwargs["top_k"] = top_k
+                print(f"使用するtop_k値: {top_k}")
+            
+            # ビームサーチを使用する場合
+            if num_beams is not None and num_beams > 1:
+                generation_kwargs["num_beams"] = num_beams
+                print(f"ビームサーチを使用: ビーム数={num_beams}")
+
+            # 入力に合わせたメッセージ形式を作成
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+            
+            # メッセージからチャットテンプレートを適用
+            input_text = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors=None  # テキストを返す
+            )
+            print(f"チャットテンプレート適用後: {input_text[:100]}...")
+
+            try:
                 # 画像とテキストを統合して処理
                 model_inputs = self.processor(
                     image_pil,
@@ -718,191 +826,114 @@ class LISAForCausalLM(nn.Module):
                         (b, n_media, n_tiles), dtype=torch.long, device=device)
                     print("aspect_ratio_ids と aspect_ratio_mask を生成しました")
 
-                # 生成パラメータ設定
-                # top_kがNoneまたは大きすぎる場合の安全対策
-                if top_k is None or top_k > 50:
-                    top_k = 5  # 最小限のtop_k値
-                print(f"使用するtop_k値: {top_k}")
+                # GPUメモリ使用状況をデバッグ出力（推論前）
+                if torch.cuda.is_available() and device.type == 'cuda':
+                    print(f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
 
-                # 異常値回避のためのパラメータ検証
-                temperature = max(0.1, min(2.0, temperature))  # 0.1~2.0の範囲に制限
-                top_p = max(0.1, min(0.99, top_p))  # 0.1~0.99の範囲に制限
-                
-                # よりシンプルな生成アプローチを使用するフラグ
-                use_simple_generation = True
+                generate_ids = None
 
-                # 基本の生成パラメータ
-                generation_params = {
-                    "input_ids": model_inputs["input_ids"],
-                    "attention_mask": model_inputs["attention_mask"],
-                    "pixel_values": model_inputs["pixel_values"],
-                    "aspect_ratio_ids": model_inputs["aspect_ratio_ids"],
-                    "aspect_ratio_mask": model_inputs["aspect_ratio_mask"],
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": temperature,
-                    "do_sample": False,  # サンプリングを無効化
-                    "num_beams": 1,      # ビームサーチを無効化
-                    "use_cache": True,
-                    "pad_token_id": self.processor.tokenizer.pad_token_id,
-                    "eos_token_id": self.processor.tokenizer.eos_token_id,
-                }
-
-                # メモリ使用量を表示
-                if torch.cuda.is_available():
-                    print(
-                        f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
-
-                # まずテンソルの形状とデバイスを確認
-                for k, v in generation_params.items():
-                    if isinstance(v, torch.Tensor):
-                        print(f"{k}: 形状={v.shape}, デバイス={v.device}, dtype={v.dtype}")
-                        # NaNとInfをチェック
-                        if torch.isnan(v).any() or torch.isinf(v).any():
-                            print(f"警告: {k}にNaNまたはInf値が含まれています。修正します。")
-                            generation_params[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
-                
-                print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, グリーディ生成={not do_sample}")
-                
-                try:
-                    if use_simple_generation:
-                        print("安全な手動生成を実行します...")
-                        
-                        # モデルを評価モードに設定
-                        model = self.model.module if hasattr(self.model, "module") else self.model
-                        model.eval()
-                        
-                        # 入力IDの準備
-                        input_ids = generation_params["input_ids"].clone()
-                        attention_mask = generation_params["attention_mask"].clone()
-                        pixel_values = generation_params["pixel_values"]
-                        aspect_ratio_ids = generation_params["aspect_ratio_ids"]
-                        aspect_ratio_mask = generation_params["aspect_ratio_mask"]
-                        
-                        # 最大トークン数
-                        max_length = input_ids.shape[1] + min(100, max_new_tokens)
-                        
-                        with torch.inference_mode():
-                            # 最初のフォワードパス - すべての入力を処理
-                            outputs = model(
-                                input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                pixel_values=pixel_values,
-                                aspect_ratio_ids=aspect_ratio_ids,
-                                aspect_ratio_mask=aspect_ratio_mask,
-                                return_dict=True,
-                                use_cache=True
-                            )
-                            
-                            # 最初のKVキャッシュを取得
-                            past_key_values = outputs.past_key_values
-                            
-                            # 現在のトークンシーケンスを保存
-                            generated = input_ids
-                            
-                            # 既存のトークン数をカウント
-                            cur_len = input_ids.shape[1]
-                            
-                            # 一度に1トークンずつ生成
-                            for _ in range(min(100, max_new_tokens)):
-                                # 次のトークンを予測
+                # DeepSpeedモデルの場合
+                if self.use_deepspeed and hasattr(self.model, 'module'):
+                    print("DeepSpeedモデルを使用して生成します...")
+                    
+                    # 入力IDsとattention_maskを取得
+                    input_ids = model_inputs.get('input_ids', None)
+                    attention_mask = model_inputs.get('attention_mask', None)
+                    
+                    # 生成に必要な引数を設定
+                    generate_inputs = {
+                        **model_inputs,
+                        **generation_kwargs
+                    }
+                    
+                    # 生成を実行
+                    try:
+                        # モジュールの generate メソッドを呼び出す
+                        if hasattr(self.model.module, 'generate'):
+                            print("model.module.generate()を使用します")
+                            with torch.no_grad():
+                                generate_ids = self.model.module.generate(**generate_inputs)
+                        else:
+                            # なければforwardを使った手動生成
+                            print("手動の生成を実行します")
+                            with torch.no_grad():
+                                # モデルの順伝播
+                                outputs = self.model(**model_inputs)
+                                # 最後のトークンを次トークンの予測に使用
                                 next_token_logits = outputs.logits[:, -1, :]
-                                
-                                # 極端な値を安全に処理
-                                next_token_logits = torch.nan_to_num(next_token_logits, nan=-float('inf'), posinf=-float('inf'), neginf=-float('inf'))
-                                
-                                # グリーディ選択（エラーを避けるため）
-                                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                                
-                                # シーケンスを更新
-                                generated = torch.cat([generated, next_tokens], dim=-1)
-                                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
-                                cur_len += 1
-                                
-                                # EOS条件をチェック
-                                if next_tokens[0, 0].item() == self.processor.tokenizer.eos_token_id:
-                                    break
-                                
-                                # 最大長をチェック
-                                if cur_len >= max_length:
-                                    break
-                                
-                                # 次のステップの入力を設定
-                                outputs = model(
-                                    input_ids=next_tokens,
-                                    attention_mask=attention_mask[:, -1:],
-                                    use_cache=True,
-                                    past_key_values=past_key_values,
-                                    return_dict=True
-                                )
-                                past_key_values = outputs.past_key_values
-                        
-                        # 生成されたシーケンスを返す
-                        generate_outputs = generated
-                        print(f"安全な手動生成が完了しました。総トークン数: {generate_outputs.shape[1]}")
-                        
-                    else:
-                        # 通常のモデル生成を試みる
-                        print("DeepSpeed環境でgenerateを実行します")
-                        generate_outputs = self.model.module.generate(**generation_params)
-                        
-                except Exception as e:
-                    print(f"生成中にエラーが発生しました: {str(e)}")
-                    print("最終的なフォールバック: 最小限の生成を試行します")
+                                # サンプリング
+                                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+                                # 入力に追加
+                                generate_ids = torch.cat([input_ids, next_token], dim=-1)
+                    except Exception as e:
+                        print(f"モデル生成時にエラー発生: {str(e)}")
+                        # フォールバック
+                        generate_ids = input_ids
+                
+                # 標準のPyTorchモデルの場合
+                else:
+                    print("標準のPyTorchモデルを使用して生成します...")
+                    
+                    # 生成に必要な引数を設定
+                    generate_inputs = {
+                        **model_inputs,
+                        **generation_kwargs
+                    }
                     
                     try:
-                        # トークナイザに戻し、最小限の応答で返す
-                        minimal_text = "すみません、画像処理中にエラーが発生しました。"
-                        minimal_tokens = self.processor.tokenizer.encode(minimal_text, return_tensors="pt").to(device)
-                        generate_outputs = torch.cat([generation_params["input_ids"][:, :10], minimal_tokens], dim=1)
-                    except Exception as e2:
-                        print(f"最終フォールバックでもエラー: {str(e2)}")
-                        # 最小限のダミー出力
-                        generate_outputs = generation_params["input_ids"]
-                        return {"masks": [], "text": "テキスト生成に失敗しました。"}
-                        
-                # 生成されたトークンIDを取得
-                generate_ids = generate_outputs.detach()
-
-                # 生成テキストをデコード
-                decoded_text = self.processor.tokenizer.batch_decode(
-                    generate_ids, skip_special_tokens=False
-                )[0]
-
-                print(f"生成テキスト: {decoded_text[:100]}...")
-
-                # トークナイザからセグメンテーショントークンのIDを取得
-                seg_token_id = self.processor.tokenizer.convert_tokens_to_ids(
-                    self.seg_token)
-
-                if seg_token_id == self.processor.tokenizer.unk_token_id:
-                    print(
-                        f"警告: セグメンテーショントークン {self.seg_token} がボキャブラリに見つかりません。UNKトークンとして処理されます。")
-
-                print(f"<seg>トークンID: {seg_token_id}")
-
-                # 生成テキスト内の<seg>トークン位置を検索
+                        # モデルが.generateメソッドを持っているか確認
+                        if hasattr(self.model, 'generate'):
+                            print("model.generate()を使用します")
+                            with torch.no_grad():
+                                generate_ids = self.model.generate(**generate_inputs)
+                        else:
+                            print("generate()メソッドが見つかりません - 手動の生成を実行します")
+                            with torch.no_grad():
+                                # モデルの順伝播
+                                outputs = self.model(**model_inputs)
+                                # 最後のトークンを次トークンの予測に使用
+                                next_token_logits = outputs.logits[:, -1, :]
+                                # サンプリング
+                                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+                                # 入力に追加
+                                generate_ids = torch.cat([model_inputs['input_ids'], next_token], dim=-1)
+                    except Exception as e:
+                        print(f"モデル生成時にエラー発生: {str(e)}")
+                        # フォールバック - 入力をそのまま返す
+                        generate_ids = model_inputs.get('input_ids', torch.zeros(1, 1, dtype=torch.long, device=device))
+                
+                # 生成されたトークンをデコード
                 try:
-                    # セグメンテーショントークンの位置を見つける
+                    generated_text = self.processor.tokenizer.batch_decode(
+                        generate_ids, skip_special_tokens=True
+                    )[0]
+                    print(f"生成テキスト (一部): {generated_text[:100]}...")
+                except Exception as decode_error:
+                    print(f"テキストデコード中にエラー: {str(decode_error)}")
+                    generated_text = "生成テキストのデコードに失敗しました。"
+                
+                # セグメンテーショントークンの位置を検索
+                try:
+                    # セグメンテーショントークンのIDを取得
+                    seg_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.seg_token)
+                    print(f"<seg>トークンID: {seg_token_id}")
+                    
+                    # 生成テキスト内の<seg>トークン位置を検索
                     seg_positions = []
                     for batch_idx in range(generate_ids.shape[0]):
-                        positions = torch.where(
-                            generate_ids[batch_idx] == seg_token_id)[0]
+                        positions = torch.where(generate_ids[batch_idx] == seg_token_id)[0]
                         for pos in positions:
                             seg_positions.append((batch_idx, pos.item()))
-
+                    
                     print(f"<seg>トークン位置: {seg_positions}")
                     
-                    masks = []  # 生成されたマスクを保存するリスト
-
-                    # 各<seg>トークンについてマスクを生成
+                    # <seg>トークンが見つかった場合、マスクを生成
                     for batch_idx, pos in seg_positions:
                         try:
                             # この位置までのシーケンスを抽出
-                            input_ids_segment = generate_ids[batch_idx,
-                                                            :pos+1].unsqueeze(0)
-                            attention_mask_segment = torch.ones_like(
-                                input_ids_segment)
-
+                            input_ids_segment = generate_ids[batch_idx, :pos+1].unsqueeze(0)
+                            attention_mask_segment = torch.ones_like(input_ids_segment)
+                            
                             # フォワードパスを実行して隠れ状態を取得
                             with torch.no_grad():
                                 # テンソルの形状とデバイスを確認
@@ -931,9 +962,12 @@ class LISAForCausalLM(nn.Module):
                                                 aspect_ratio_mask_segment = torch.nan_to_num(
                                                     aspect_ratio_mask_segment, nan=0.0, posinf=1.0, neginf=0.0)
                                 
+                                # モデルがモジュール（DeepSpeed）かどうかチェック
+                                model_for_inference = self.model.module if hasattr(self.model, 'module') else self.model
+                                
                                 # GPUでの処理を試みる
                                 try:
-                                    outputs = self.model.module(
+                                    outputs = model_for_inference(
                                         input_ids=input_ids_segment.to(device),
                                         attention_mask=attention_mask_segment.to(device),
                                         pixel_values=pixel_values_segment.to(device),
@@ -951,8 +985,8 @@ class LISAForCausalLM(nn.Module):
                                     
                                     # CPUに移動して再試行
                                     try:
-                                        # モデルをCPUに移動
-                                        model_cpu = self.model.module.to('cpu')
+                                        # モデルをCPUに移動（一時的に）
+                                        model_cpu = model_for_inference.to('cpu')
                                         
                                         outputs = model_cpu(
                                             input_ids=input_ids_segment.cpu(),
@@ -965,7 +999,7 @@ class LISAForCausalLM(nn.Module):
                                         )
                                         
                                         # 処理後、モデルをGPUに戻す
-                                        self.model.module.to(device)
+                                        model_for_inference.to(device)
                                         print("CPUでの隠れ状態取得に成功しました")
                                         
                                     except Exception as cpu_error:
@@ -1057,64 +1091,34 @@ class LISAForCausalLM(nn.Module):
                                     dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8)
                                     masks.append(dummy_mask)
                                     print(f"hidden_statesなしのダミーマスク生成: 形状={dummy_mask.shape}")
-                        
-                        except Exception as seg_error:
-                            print(f"セグメンテーショントークン処理中にエラー: {str(seg_error)}")
-                            masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
-                            
-                except Exception as token_error:
-                    print(f"トークン処理中にエラー: {str(token_error)}")
-                    # エラーの詳細を表示
-                    import traceback
-                    traceback.print_exc()
-                    masks = []  # 空のマスクリスト
-                    
-                # 最終テキストを取得（特殊トークンを除去）
-                final_text = self.processor.tokenizer.decode(
-                    generate_ids[0], skip_special_tokens=True
-                )
-                
-                # 不要なトークンを削除
-                if self.seg_token in final_text:
-                    final_text = final_text.replace(self.seg_token, "")
-                    
-                    # その他の特殊トークンも削除
-                    for token in ["<s>", "</s>", "<unk>"]:
-                        final_text = final_text.replace(token, "")
 
-            except Exception as e:
-                print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
+                        except Exception as segment_error:
+                            print(f"セグメント処理中にエラー: {str(segment_error)}")
+                            # エラー時のフォールバック
+                            masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
+                
+                except Exception as token_error:
+                    print(f"トークン検索中にエラー: {str(token_error)}")
+                    # トークン検索エラー時のフォールバック
+                    return {"masks": [], "text": generated_text}
+            
+            except Exception as process_error:
+                print(f"入力処理中にエラー: {str(process_error)}")
                 import traceback
                 traceback.print_exc()
-                return {"masks": [], "text": f"画像処理エラー: {str(e)}"}
-
+                return {"masks": [], "text": f"入力処理エラー: {str(process_error)}"}
+            
+            # 最終的な結果を返す
+            return {"masks": masks, "text": generated_text}
+            
         except Exception as e:
-            print(f"セグメンテーション生成中にエラーが発生しました: {str(e)}")
+            print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
             import traceback
             traceback.print_exc()
-            return {"masks": [], "text": f"全体的なエラー: {str(e)}"}
-
-        # 特殊トークンを除外した最終テキストを生成
-        if 'clean_text' in locals():
-            final_text = clean_text
-        elif 'decoded_text' in locals():
-            # 特殊トークンを手動で除外
-            final_text = decoded_text.replace(self.seg_token, "")
-            # その他の特殊トークンも除外
-            for token in ["<s>", "</s>", "<unk>"]:
-                final_text = final_text.replace(token, "")
-        else:
-            final_text = "テキスト生成に失敗しました。"
-
-        # マスクの形式を確認して、正しい形式で返す
-        print(f"生成されたマスク数: {len(masks)}")
-        for i, mask in enumerate(masks):
-            print(f"マスク {i+1} の形状: {mask.shape}, 型: {type(mask)}")
-
-        return {"masks": masks, "text": final_text.strip()}
+            return {"masks": [], "text": f"画像処理エラー: {str(e)}"}
 
     @classmethod
-    def from_pretrained(cls, model_path, sam_checkpoint=None, use_deepspeed=False, ds_config=None, local_rank=-1, **kwargs):
+    def from_pretrained(cls, model_path, sam_checkpoint=None, use_deepspeed=False, ds_config=None, local_rank=-1, infer=True, **kwargs):
         """
         事前学習済みモデルからLISAモデルを作成
 
@@ -1124,6 +1128,7 @@ class LISAForCausalLM(nn.Module):
             use_deepspeed: DeepSpeedを使用するかどうか
             ds_config: DeepSpeedの設定
             local_rank: ローカルランク（DeepSpeed用）
+            infer: 推論モードかどうか (デフォルト: True)
             **kwargs: その他の引数
         """
         return cls(
@@ -1132,6 +1137,7 @@ class LISAForCausalLM(nn.Module):
             use_deepspeed=use_deepspeed,
             ds_config=ds_config,
             local_rank=local_rank,
+            infer=infer,
             **kwargs
         )
 
