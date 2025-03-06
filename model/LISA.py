@@ -486,8 +486,13 @@ class LISAForCausalLM(nn.Module):
 
                 # 入力に合わせたメッセージ形式を作成
                 messages = [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt}
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
                 ]
                 
                 # メッセージからチャットテンプレートを適用
