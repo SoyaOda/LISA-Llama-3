@@ -534,14 +534,25 @@ class LISAForCausalLM(nn.Module):
                         (b, n_media, n_tiles), dtype=torch.long, device=device)
                     print("aspect_ratio_ids と aspect_ratio_mask を生成しました")
 
-                # 生成パラメータ設定
                 # top_kがNoneまたは大きすぎる場合の安全対策
-                if top_k is None or top_k > 50:
+                if top_k is None or not isinstance(top_k, int) or top_k < 1:
+                    top_k = 30  # 安全なデフォルト値
+                elif top_k > 50:
                     top_k = 50  # 安全な最大値に制限
+                    
+                print(f"使用するtop_k値: {top_k}")
 
                 # 異常値回避のためのパラメータ検証
                 temperature = max(0.1, min(2.0, temperature))  # 0.1~2.0の範囲に制限
                 top_p = max(0.1, min(0.99, top_p))  # 0.1~0.99の範囲に制限
+                
+                # num_beamsも検証
+                if num_beams > 1 and do_sample:
+                    print("警告: do_sampleとnum_beams > 1の両方を指定すると問題が発生する可能性があります。do_sampleをFalseに設定します。")
+                    do_sample = False
+                    
+                # パラメータログ
+                print(f"生成パラメータ設定: temperature={temperature}, top_p={top_p}, top_k={top_k}, do_sample={do_sample}, num_beams={num_beams}")
 
                 generation_params = {
                     "input_ids": model_inputs["input_ids"],
@@ -567,83 +578,84 @@ class LISAForCausalLM(nn.Module):
                         f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
 
                 try:
+                    # まずテンソルの形状とデバイスを確認
+                    for k, v in generation_params.items():
+                        if isinstance(v, torch.Tensor):
+                            print(f"{k}: 形状={v.shape}, デバイス={v.device}, dtype={v.dtype}")
+                            # NaNとInfをチェック
+                            if torch.isnan(v).any() or torch.isinf(v).any():
+                                print(f"警告: {k}にNaNまたはInf値が含まれています。修正します。")
+                                generation_params[k] = torch.nan_to_num(v, nan=0.0, posinf=1.0, neginf=0.0)
+                                
                     print("DeepSpeed環境でgenerateを実行します")
-
-                    # パラメータ詳細のログ
-                    print(
-                        f"生成パラメータ: max_new_tokens={max_new_tokens}, temperature={temperature}, top_k={top_k}, top_p={top_p}")
-
+                    
+                    # スコアがNaNになる問題を回避するためにdo_sampleをオフにするオプション
+                    use_safe_sampling = True
+                    if use_safe_sampling and do_sample and temperature <= 0.1:
+                        print("安全な生成のためtemperatureを0.2に引き上げます")
+                        generation_params["temperature"] = 0.2
+                        
                     # DeepSpeedのモジュールを使用して生成
                     generate_outputs = self.model.module.generate(
                         **generation_params)
+
                 except Exception as e:
                     print(f"通常のgenerateでエラーが発生しました: {str(e)}")
-
+                    
                     try:
                         print("フォールバック: シンプルな生成方法を試行します")
 
-                        # CPUに移動して再試行する前にGPUキャッシュをクリア
+                        # GPUキャッシュをクリア
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                             print("GPUキャッシュをクリアしました")
 
-                        # top_kをさらに小さくして再試行
-                        top_k = min(10, top_k)  # さらに小さいtop_kを使用
-                        # 小さすぎるtemperatureを避ける
-                        temperature = max(0.2, temperature)
-                        do_sample = True  # サンプリングを有効に
-
-                        # CPUで処理する前に入力をCPUに移動
-                        cpu_inputs = {}
-                        for k, v in generation_params.items():
-                            if isinstance(v, torch.Tensor):
-                                cpu_inputs[k] = v.detach().cpu()
-                            else:
-                                cpu_inputs[k] = v
-
-                        # top_kを更新
-                        cpu_inputs["top_k"] = top_k
-                        cpu_inputs["temperature"] = temperature
-                        cpu_inputs["do_sample"] = do_sample
-
-                        # メモリ使用量削減のためデバイスをCPUに
-                        with torch.no_grad():
-                            model_cpu = self.model.module.to('cpu')
-                            generate_outputs = model_cpu.generate(**cpu_inputs)
-                            # 結果を取得後、モデルをGPUに戻す
-                            self.model.module.to(device)
-
+                        # パラメータの修正 - 最も安全な値に設定
+                        safe_params = generation_params.copy()
+                        safe_params["do_sample"] = False  # グリーディ検索
+                        safe_params["num_beams"] = 1  # ビームサーチを無効化
+                        safe_params["top_k"] = 10  # 小さな値
+                        safe_params["temperature"] = 1.0  # ニュートラル
+                        safe_params["max_new_tokens"] = min(256, max_new_tokens)  # 短く制限
+                        
+                        # same deviceで試行
+                        generate_outputs = self.model.module.generate(**safe_params)
+                            
                     except Exception as e2:
                         print(f"フォールバック生成でもエラーが発生しました: {str(e2)}")
-
-                        # さらなるフォールバック：完全なグリーディ生成を試行
+                        
+                        # CPU処理を試行
                         try:
-                            print("最終フォールバック: グリーディ生成を試行します")
-
-                            # greedy search、パラメータ最小化
-                            minimal_params = {
-                                "input_ids": cpu_inputs["input_ids"] if 'cpu_inputs' in locals() else generation_params["input_ids"].detach().cpu(),
-                                # トークン数制限
-                                "max_new_tokens": min(128, max_new_tokens),
-                                "do_sample": False,  # greedy search
-                                "use_cache": True,
-                                "pad_token_id": self.processor.tokenizer.pad_token_id,
-                                "eos_token_id": self.processor.tokenizer.eos_token_id,
-                            }
-
+                            print("CPU処理に切り替えます")
+                            
+                            # CPUに移動する前にGPUキャッシュをクリア
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                
+                            # CPUに移動
+                            cpu_inputs = {}
+                            for k, v in safe_params.items():
+                                if isinstance(v, torch.Tensor):
+                                    cpu_inputs[k] = v.detach().cpu()
+                                else:
+                                    cpu_inputs[k] = v
+                            
+                            # さらに安全なパラメータを設定
+                            cpu_inputs["do_sample"] = False  # 確定的
+                            cpu_inputs["max_new_tokens"] = min(100, max_new_tokens)  # さらに短く
+                            
                             # CPU上で実行
                             with torch.no_grad():
                                 model_cpu = self.model.module.to('cpu')
-                                generate_outputs = model_cpu.generate(
-                                    **minimal_params)
-                                # 結果を取得後、モデルをGPUに戻す
+                                generate_outputs = model_cpu.generate(**cpu_inputs)
+                                # モデルをGPUに戻す
                                 self.model.module.to(device)
-
+                                
                         except Exception as e3:
                             print(f"全ての生成方法が失敗しました: {str(e3)}")
-                            # ダミーのテキスト生成結果を返す
+                            # 最終フォールバック - ダミーの結果を返す
                             return {"masks": [], "text": f"テキスト生成に失敗しました: {str(e3)}"}
-
+                            
                 # 生成されたトークンIDを取得
                 generate_ids = generate_outputs.detach()
 
@@ -675,199 +687,195 @@ class LISAForCausalLM(nn.Module):
                             seg_positions.append((batch_idx, pos.item()))
 
                     print(f"<seg>トークン位置: {seg_positions}")
+                    
+                    masks = []  # 生成されたマスクを保存するリスト
 
                     # 各<seg>トークンについてマスクを生成
                     for batch_idx, pos in seg_positions:
                         try:
                             # この位置までのシーケンスを抽出
                             input_ids_segment = generate_ids[batch_idx,
-                                                             :pos+1].unsqueeze(0)
+                                                            :pos+1].unsqueeze(0)
                             attention_mask_segment = torch.ones_like(
                                 input_ids_segment)
 
                             # フォワードパスを実行して隠れ状態を取得
                             with torch.no_grad():
-                                # pixel_valuesやaspect_ratio関連のテンソルが正しい形状であることを確認
-                                # batch_size=1に制限して取得
+                                # テンソルの形状とデバイスを確認
                                 pixel_values_segment = model_inputs['pixel_values'][:1]
-                                aspect_ratio_ids_segment = model_inputs['aspect_ratio_ids'][
-                                    :1] if 'aspect_ratio_ids' in model_inputs else None
-                                aspect_ratio_mask_segment = model_inputs['aspect_ratio_mask'][
-                                    :1] if 'aspect_ratio_mask' in model_inputs else None
+                                aspect_ratio_ids_segment = model_inputs['aspect_ratio_ids'][:1] if 'aspect_ratio_ids' in model_inputs else None
+                                aspect_ratio_mask_segment = model_inputs['aspect_ratio_mask'][:1] if 'aspect_ratio_mask' in model_inputs else None
 
-                                print(
-                                    f"フォワードパス用 pixel_values: 形状={pixel_values_segment.shape}")
-                                if aspect_ratio_ids_segment is not None:
-                                    print(
-                                        f"フォワードパス用 aspect_ratio_ids: 形状={aspect_ratio_ids_segment.shape}")
-                                if aspect_ratio_mask_segment is not None:
-                                    print(
-                                        f"フォワードパス用 aspect_ratio_mask: 形状={aspect_ratio_mask_segment.shape}")
-
-                                # 値がNaNまたはInfでないことを確認
-                                for tensor_name, tensor in [("pixel_values", pixel_values_segment),
-                                                            ("aspect_ratio_ids",
-                                                             aspect_ratio_ids_segment),
-                                                            ("aspect_ratio_mask", aspect_ratio_mask_segment)]:
-                                    if tensor is not None and torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                                        print(
-                                            f"警告: {tensor_name}にNaNまたはInf値が含まれています")
-                                        if tensor_name == "pixel_values":
-                                            # NaNやInfを0に置き換え
-                                            pixel_values_segment = torch.nan_to_num(
-                                                pixel_values_segment, nan=0.0, posinf=1.0, neginf=0.0)
-
+                                print(f"フォワードパス用 pixel_values: 形状={pixel_values_segment.shape}")
+                                
+                                # NaNとInfをチェックして修正
+                                for tensor_name, tensor in [
+                                    ("pixel_values", pixel_values_segment),
+                                    ("aspect_ratio_ids", aspect_ratio_ids_segment),
+                                    ("aspect_ratio_mask", aspect_ratio_mask_segment)
+                                ]:
+                                    if tensor is not None:
+                                        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                                            print(f"警告: {tensor_name}にNaNまたはInf値が含まれています。修正します。")
+                                            if tensor_name == "pixel_values":
+                                                pixel_values_segment = torch.nan_to_num(
+                                                    pixel_values_segment, nan=0.0, posinf=1.0, neginf=0.0)
+                                            elif tensor_name == "aspect_ratio_ids":
+                                                aspect_ratio_ids_segment = torch.nan_to_num(
+                                                    aspect_ratio_ids_segment, nan=0.0, posinf=1.0, neginf=0.0)
+                                            elif tensor_name == "aspect_ratio_mask":
+                                                aspect_ratio_mask_segment = torch.nan_to_num(
+                                                    aspect_ratio_mask_segment, nan=0.0, posinf=1.0, neginf=0.0)
+                                
+                                # GPUでの処理を試みる
                                 try:
-                                    # まずGPUで試す
-                                    outputs = self.model(
-                                        input_ids=input_ids_segment,
-                                        attention_mask=attention_mask_segment,
-                                        pixel_values=pixel_values_segment,
-                                        aspect_ratio_ids=aspect_ratio_ids_segment,
-                                        aspect_ratio_mask=aspect_ratio_mask_segment,
+                                    outputs = self.model.module(
+                                        input_ids=input_ids_segment.to(device),
+                                        attention_mask=attention_mask_segment.to(device),
+                                        pixel_values=pixel_values_segment.to(device),
+                                        aspect_ratio_ids=aspect_ratio_ids_segment.to(device) if aspect_ratio_ids_segment is not None else None,
+                                        aspect_ratio_mask=aspect_ratio_mask_segment.to(device) if aspect_ratio_mask_segment is not None else None,
                                         output_hidden_states=True,
                                         return_dict=True
                                     )
+                                    
+                                    print("GPUでの隠れ状態取得に成功しました")
+                                    
                                 except Exception as e:
                                     print(f"GPUでの隠れ状態取得中にエラー: {str(e)}")
                                     print("CPUでの処理に切り替えます")
-
+                                    
                                     # CPUに移動して再試行
                                     try:
                                         # モデルをCPUに移動
-                                        model_cpu = self.model.to('cpu')
-
+                                        model_cpu = self.model.module.to('cpu')
+                                        
                                         outputs = model_cpu(
-                                            input_ids=input_ids_segment.to(
-                                                'cpu'),
-                                            attention_mask=attention_mask_segment.to(
-                                                'cpu'),
-                                            pixel_values=pixel_values_segment.to(
-                                                'cpu'),
-                                            aspect_ratio_ids=aspect_ratio_ids_segment.to(
-                                                'cpu') if aspect_ratio_ids_segment is not None else None,
-                                            aspect_ratio_mask=aspect_ratio_mask_segment.to(
-                                                'cpu') if aspect_ratio_mask_segment is not None else None,
+                                            input_ids=input_ids_segment.cpu(),
+                                            attention_mask=attention_mask_segment.cpu(),
+                                            pixel_values=pixel_values_segment.cpu(),
+                                            aspect_ratio_ids=aspect_ratio_ids_segment.cpu() if aspect_ratio_ids_segment is not None else None,
+                                            aspect_ratio_mask=aspect_ratio_mask_segment.cpu() if aspect_ratio_mask_segment is not None else None,
                                             output_hidden_states=True,
                                             return_dict=True
                                         )
-
+                                        
                                         # 処理後、モデルをGPUに戻す
-                                        self.model.to(device)
+                                        self.model.module.to(device)
+                                        print("CPUでの隠れ状態取得に成功しました")
+                                        
                                     except Exception as cpu_error:
-                                        print(
-                                            f"CPUでの処理も失敗しました: {str(cpu_error)}")
-                                        # ダミーの隠れ状態を作成し続行を試みる
-                                        hidden_dim = self.model.module.config.text_config.hidden_size
-                                        dummy_hidden_states = [
-                                            [torch.zeros((1, 1, hidden_dim), device='cpu')]]
+                                        print(f"CPUでの処理も失敗しました: {str(cpu_error)}")
+                                        # ダミーの隠れ状態とマスク情報を返し、次のトークンへ
+                                        masks.append({
+                                            "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                            "area": 0,
+                                            "predicted_iou": 0.0,
+                                            "stability_score": 0.0,
+                                            "error": str(cpu_error)
+                                        })
+                                        continue  # 次のトークンへ
 
-                                        outputs = type('DummyOutputs', (), {})
-                                        outputs.hidden_states = dummy_hidden_states
-                                        print(
-                                            f"ダミーの隠れ状態を生成しました: 形状={dummy_hidden_states[-1][0].shape}")
-
-                                # ここでoutputsを使用
-                                if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
-                                    # 最後の位置（<seg>トークン）の隠れ状態を取得
-                                    hidden_states = outputs.hidden_states[-1][0, -1]
-                                    print(
-                                        f"隠れ状態: 形状={hidden_states.shape}, デバイス={hidden_states.device}")
-
-                                    # 隠れ状態をSAMの次元（256次元）に投影
-                                    point_embedding = self.seg_projection(
-                                        hidden_states)
-                                    print(
-                                        f"投影前のpoint_embedding: 形状={point_embedding.shape}, デバイス={point_embedding.device}")
-
-                                    # SAMデバイスを確認し、必要に応じて移動
-                                    sam_device = next(
-                                        self.sam.parameters()).device
-                                    point_embedding = point_embedding.to(
-                                        sam_device)
-
-                                    print(
-                                        f"SAMプロンプト埋め込み: 形状={point_embedding.shape}, デバイス={point_embedding.device}")
-
-                                    # SAMデコーダを実行してマスクを生成
-                                    sparse_embeddings = point_embedding.unsqueeze(
-                                        0)
-
+                                # 隠れ状態を取得
+                                # 最後の層から<seg>トークンの最後の隠れ状態を抽出
+                                if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                                    hidden_states = outputs.hidden_states[-1]
+                                    seg_hidden_state = hidden_states[0, -1]  # バッチ0、最後の位置
+                                    
+                                    print(f"<seg>トークンの隠れ状態: 形状={seg_hidden_state.shape}")
+                                    
+                                    # SAMの予測に使用する形式にプロジェクション
+                                    prompt_embedding = self.seg_projection(seg_hidden_state)
+                                    
+                                    # データタイプをfloat32に変換（SAMの要件に合わせる）
+                                    prompt_embedding = prompt_embedding.float()
+                                    
+                                    # SAMへの入力を準備
+                                    # 画像特徴マップがdeviceと一致していることを確認
+                                    sam_image_embedding = sam_image_embedding.to(prompt_embedding.device)
+                                    
                                     try:
-                                        # SAM画像埋め込みがSAMデバイスにあることを確認
-                                        sam_image_embedding_on_device = sam_image_embedding.to(
-                                            sam_device)
-
-                                        # SAMによるマスク生成
-                                        print(
-                                            f"SAM入力: image_embeddings={sam_image_embedding_on_device.shape}, sparse_embeddings={sparse_embeddings.shape}")
-
-                                        mask_predictions, _ = self.sam.mask_decoder(
-                                            image_embeddings=sam_image_embedding_on_device,
+                                        # SAMモデルでマスクを予測
+                                        masks_predictions, scores, logits = self.sam.mask_decoder(
+                                            image_embeddings=sam_image_embedding,
                                             image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                                            sparse_prompt_embeddings=sparse_embeddings,
+                                            sparse_prompt_embeddings=prompt_embedding.unsqueeze(0),
                                             dense_prompt_embeddings=None,
                                             multimask_output=False,
                                         )
-
-                                        # マスク予測を取得して後処理
-                                        # [1, 1, H, W]
-                                        mask_pred = mask_predictions[0]
-
-                                        # nan値やinf値がないか確認
-                                        if torch.isnan(mask_pred).any() or torch.isinf(mask_pred).any():
-                                            print(
-                                                "警告: マスク予測にNaNまたはInf値が含まれています")
-                                            # NaNやInfを0に置き換え
-                                            mask_pred = torch.nan_to_num(
-                                                mask_pred, nan=0.0, posinf=1.0, neginf=0.0)
-
-                                        mask_pred = torch.sigmoid(mask_pred)
-                                        mask_binary = (mask_pred > 0.5).float()
-                                        mask_np = mask_binary[0, 0].cpu(
-                                        ).numpy()
-                                        masks.append(mask_np)
-
-                                        print(
-                                            f"マスク {len(masks)} を生成しました: 形状={mask_np.shape}")
-
+                                        
+                                        # マスク予測結果がNaNまたはInfを含んでいないか確認
+                                        if torch.isnan(masks_predictions).any() or torch.isinf(masks_predictions).any():
+                                            print("警告: マスク予測にNaNまたはInf値が含まれています。0に置き換えます。")
+                                            masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
+                                        
+                                        # マスクをリサイズして画像の元のサイズに合わせる
+                                        mask = F.interpolate(
+                                            masks_predictions,
+                                            size=(self.image_size, self.image_size),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                        
+                                        # マスクを2値化
+                                        mask = (mask > 0).float().cpu().numpy()
+                                        
+                                        # マスク情報をリストに追加
+                                        masks.append({
+                                            "segmentation": mask[0, 0],
+                                            "area": mask[0, 0].sum().item(),
+                                            "predicted_iou": scores[0].item(),
+                                            "stability_score": 1.0
+                                        })
+                                    
                                     except Exception as mask_error:
-                                        print(
-                                            f"SAMマスク生成中にエラー: {str(mask_error)}")
-                                        import traceback
-                                        traceback.print_exc()
-
-                                        # デバッグ情報
-                                        print(
-                                            f"SAM画像埋め込み: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}, dtype={sam_image_embedding.dtype}")
-                                        print(
-                                            f"スパース埋め込み: 形状={sparse_embeddings.shape}, デバイス={sparse_embeddings.device}, dtype={sparse_embeddings.dtype}")
-
-                                        # 空のダミーマスクを追加（失敗した場合）
-                                        if sam_image_embedding.shape[0] > 0:
-                                            h, w = sam_image_embedding.shape[-2] * \
-                                                4, sam_image_embedding.shape[-1] * 4
-                                            dummy_mask = np.zeros(
-                                                (h, w), dtype=np.float32)
-                                            masks.append(dummy_mask)
-                                            print(
-                                                f"ダミーマスクを追加しました: 形状={dummy_mask.shape}")
+                                        print(f"マスク生成中にエラー: {str(mask_error)}")
+                                        # ダミーのマスクを追加
+                                        masks.append({
+                                            "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                            "area": 0,
+                                            "predicted_iou": 0.0,
+                                            "stability_score": 0.0,
+                                            "error": str(mask_error)
+                                        })
+                                
                                 else:
                                     print(
-                                        "隠れ状態が見つかりません: outputs.hidden_statesがありません")
-
-                        except Exception as e:
-                            print(f"マスク生成中にエラーが発生しました: {str(e)}")
-                            import traceback
-                            traceback.print_exc()
-
-                except Exception as e:
-                    print(f"トークン生成中にエラーが発生しました: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-
-                    # 最低限のテキスト応答を返す
-                    return {"masks": masks, "text": f"エラーが発生しました: {str(e)}"}
+                                        "警告: hidden_statesが取得できませんでした")
+                                    masks.append({
+                                        "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                        "area": 0,
+                                        "predicted_iou": 0.0,
+                                        "stability_score": 0.0,
+                                        "error": "hidden_states not available"
+                                    })
+                        
+                        except Exception as seg_error:
+                            print(f"セグメンテーショントークン処理中にエラー: {str(seg_error)}")
+                            masks.append({
+                                "segmentation": np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                                "area": 0,
+                                "predicted_iou": 0.0,
+                                "stability_score": 0.0,
+                                "error": str(seg_error)
+                            })
+                            
+                except Exception as token_error:
+                    print(f"トークン処理中にエラー: {str(token_error)}")
+                    masks = []  # 空のマスクリスト
+                    
+                # 最終テキストを取得（特殊トークンを除去）
+                final_text = self.processor.tokenizer.decode(
+                    generate_ids[0], skip_special_tokens=True
+                )
+                
+                # 不要なトークンを削除
+                if self.seg_token in final_text:
+                    final_text = final_text.replace(self.seg_token, "")
+                    
+                    # その他の特殊トークンも削除
+                    for token in ["<s>", "</s>", "<unk>"]:
+                        final_text = final_text.replace(token, "")
 
             except Exception as e:
                 print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
