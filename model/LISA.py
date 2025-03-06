@@ -17,6 +17,7 @@ import json
 import shutil
 import torch.distributed as dist
 import re
+import traceback
 
 
 class LISAForCausalLM(nn.Module):
@@ -777,33 +778,70 @@ class LISAForCausalLM(nn.Module):
                 print(f"ビームサーチを使用: ビーム数={num_beams}")
 
             # チャットメッセージの構成
-            # Llama 3.2 Visionの最適なプロンプト形式を使用
-            # システムプロンプトを改善（日本語出力と品質向上用）
-            messages = [
-                {
-                    "role": "system",
-                    "content": "あなたは画像理解に優れた高性能AIアシスタントです。ユーザーの質問に対して、画像の内容を詳しく分析し、日本語で明確かつ詳細に回答してください。特に人物や物体の特徴、位置関係、色彩などを具体的に説明することを心がけてください。専門的で正確な情報を提供し、日本語の文法や表現を自然に使用してください。"
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
+            # Llama 3.2 Vision の推奨プロンプト形式を使用
+            # プロンプトの言語を検出
+            is_japanese = any(ord(c) > 127 for c in prompt)
+            is_english = not is_japanese
             
-            # メッセージからチャットテンプレートを適用
+            # プロンプト言語によってシステムプロンプトを選択
+            if is_japanese:
+                system_content = "あなたは画像理解に優れた高性能AIアシスタントです。ユーザーの質問に対して、画像の内容を詳しく分析し、日本語で明確かつ詳細に回答してください。特に人物や物体の特徴、位置関係、色彩などを具体的に説明することを心がけてください。"
+            else:
+                system_content = "You are a highly capable AI assistant specialized in image understanding. Analyze the content of images carefully and provide clear, detailed responses to user questions. Focus on describing features, spatial relationships, and visual elements accurately."
+
+            # マルチモーダル会話用のメッセージ構造
+            # マルチモーダル対応LLMはシステムメッセージなしの構造が推奨される場合がある
+            # まず推奨形式（システムメッセージなし）を試し、失敗した場合のみシステムメッセージを追加
             try:
+                # システムメッセージなしでまず試行
+                simple_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
+                ]
+                
                 input_text = self.processor.apply_chat_template(
-                    messages,
+                    simple_messages,
                     add_generation_prompt=True,
                     return_tensors=None  # テキストを返す
                 )
-            except Exception as template_error:
-                print(f"チャットテンプレート適用エラー: {template_error}")
-                # フォールバック：単純なテンプレート適用
-                input_text = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nあなたは画像理解に優れた高性能AIアシスタントです。ユーザーの質問に対して、画像の内容を詳しく分析し、日本語で明確かつ詳細に回答してください。特に人物や物体の特徴、位置関係、色彩などを具体的に説明することを心がけてください。専門的で正確な情報を提供し、日本語の文法や表現を自然に使用してください。<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                print("システムメッセージなしのシンプルなチャットテンプレートを適用しました")
+            except Exception as simple_template_error:
+                print(f"シンプルテンプレート適用エラー: {simple_template_error}")
+                try:
+                    # システムメッセージを含めて再試行
+                    messages_with_system = [
+                        {
+                            "role": "system",
+                            "content": system_content
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": prompt}
+                            ]
+                        }
+                    ]
+                    
+                    input_text = self.processor.apply_chat_template(
+                        messages_with_system,
+                        add_generation_prompt=True,
+                        return_tensors=None  # テキストを返す
+                    )
+                    print("システムメッセージを含むチャットテンプレートを適用しました")
+                except Exception as system_template_error:
+                    print(f"システムテンプレート適用エラー: {system_template_error}")
+                    # 最終フォールバック：直接テンプレートを構築
+                    if is_japanese:
+                        input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    else:
+                        input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    print("フォールバック：最小限のテンプレートを手動で適用しました")
                 
             print(f"チャットテンプレート適用後: {input_text[:100]}...")
 
@@ -843,37 +881,63 @@ class LISAForCausalLM(nn.Module):
                 if torch.cuda.is_available() and device.type == 'cuda':
                     print(f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
 
-                # Llama 3.2 Vision向け最適化パラメータ
-                generation_kwargs = {
-                    'do_sample': do_sample if do_sample is not None else True,
-                    'temperature': min(0.2, temperature if temperature is not None else 0.2),
-                    'top_p': max(0.9, top_p if top_p is not None else 0.9),
-                    'repetition_penalty': max(1.3, repetition_penalty if repetition_penalty is not None else 1.3),
-                    'max_new_tokens': max_new_tokens,
-                    'num_beams': max(1, num_beams if num_beams is not None else 1),
-                    'use_cache': True,
-                    'eos_token_id': self.processor.tokenizer.eos_token_id,
-                    'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
-                    'early_stopping': num_beams > 1,  # ビーム探索時のみ有効
-                    'length_penalty': 1.0,  # 長さに対するペナルティ（1.0=ニュートラル）
-                    'no_repeat_ngram_size': 3,  # 3-gramの繰り返しを防止
-                }
-                
-                # 日本語プロンプトの場合、日本語生成に特化したパラメータ
-                if any(ord(c) > 127 for c in prompt):
-                    print("日本語プロンプトを検出: 日本語生成パラメータを最適化")
-                    # 日本語生成のための最適パラメータ
-                    generation_kwargs.update({
+                # 言語に応じた最適な生成パラメータを設定
+                if is_japanese:
+                    # 日本語生成の最適パラメータ
+                    print("日本語プロンプトを検出: 日本語生成パラメータを適用")
+                    generation_kwargs = {
                         'do_sample': False,  # 決定的な生成
                         'temperature': 0.1,  # 非常に低温
                         'top_p': 0.95,       # 高いトップ確率
-                        'repetition_penalty': 1.5,  # 繰り返しを強く抑制
-                        'no_repeat_ngram_size': 4,  # 4-gramの繰り返しを防止（日本語はより長いn-gramが効果的）
-                    })
-                
-                # デバッグ情報を出力
-                print(f"生成パラメータ: {', '.join([f'{k}={v}' for k, v in generation_kwargs.items() if k not in ['eos_token_id', 'pad_token_id']])}")
+                        'repetition_penalty': 1.8,  # 繰り返しを強く抑制
+                        'max_new_tokens': max_new_tokens,
+                        'num_beams': max(1, num_beams if num_beams is not None else 1),
+                        'use_cache': True,
+                        'eos_token_id': self.processor.tokenizer.eos_token_id,
+                        'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
+                        'early_stopping': num_beams > 1 if num_beams is not None else False,
+                        'no_repeat_ngram_size': 4,  # 4-gramの繰り返しを防止
+                        'bad_words_ids': None,  # 生成を制限する単語なし
+                    }
+                else:
+                    # 英語生成の最適パラメータ
+                    print("英語プロンプトを検出: 英語生成パラメータを適用")
+                    generation_kwargs = {
+                        'do_sample': True,   # サンプリングを有効化
+                        'temperature': 0.7,  # 適度な温度
+                        'top_p': 0.9,        # バランスの取れたトップ確率
+                        'repetition_penalty': 1.2,  # 適度な繰り返し抑制
+                        'max_new_tokens': max_new_tokens,
+                        'num_beams': max(1, num_beams if num_beams is not None else 1),
+                        'use_cache': True,
+                        'eos_token_id': self.processor.tokenizer.eos_token_id,
+                        'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
+                        'early_stopping': num_beams > 1 if num_beams is not None else False,
+                        'no_repeat_ngram_size': 3,  # 3-gramの繰り返しを防止
+                        'bad_words_ids': None,  # 生成を制限する単語なし
+                        'remove_invalid_values': True,  # 無効な値を除去
+                    }
 
+                # ユーザー指定のパラメータで上書き（指定がある場合のみ）
+                if temperature is not None and temperature > 0:
+                    generation_kwargs['temperature'] = temperature
+                if top_p is not None and 0 < top_p <= 1.0:
+                    generation_kwargs['top_p'] = top_p
+                if repetition_penalty is not None and repetition_penalty > 0:
+                    generation_kwargs['repetition_penalty'] = repetition_penalty
+                if do_sample is not None:
+                    generation_kwargs['do_sample'] = do_sample
+                if top_k is not None and top_k > 0:
+                    generation_kwargs['top_k'] = top_k
+                
+                # 重要なパラメータを出力
+                print(f"生成パラメータ: temperature={generation_kwargs.get('temperature', 'N/A')}, " +
+                      f"top_p={generation_kwargs.get('top_p', 'N/A')}, " +
+                      f"repetition_penalty={generation_kwargs.get('repetition_penalty', 'N/A')}, " +
+                      f"do_sample={generation_kwargs.get('do_sample', 'N/A')}, " +
+                      f"num_beams={generation_kwargs.get('num_beams', 'N/A')}")
+
+                # 生成開始
                 generate_ids = None
 
                 # DeepSpeedモデルの場合
@@ -963,65 +1027,108 @@ class LISAForCausalLM(nn.Module):
                 
                 # 生成されたトークンをデコード
                 try:
-                    # トークン化された出力をテキストにデコード
-                    # 特殊トークンを保持（<seg>を含む）
-                    generated_text = self.processor.tokenizer.batch_decode(
-                        generate_ids, 
-                        skip_special_tokens=False,  # 特殊トークンを保持
-                        clean_up_tokenization_spaces=True  # トークン化スペースをクリーンアップ
-                    )[0]
+                    # モデルのトークナイザを使ってデコード
+                    # 特殊トークンを保持（<seg>のみ明示的に保持）
+                    special_tokens_to_keep = [self.seg_token]
+                    all_special_tokens = set(self.processor.tokenizer.all_special_tokens)
+                    skip_special_tokens = all_special_tokens - set(special_tokens_to_keep)
                     
-                    # アシスタントの応答部分を抽出
-                    assistant_prefix_patterns = [
-                        "<|start_header_id|>assistant<|end_header_id|>",
-                        "assistant\n",
-                        "\nassistant:",
-                        "Assistant:"
+                    print(f"スキップする特殊トークン数: {len(skip_special_tokens)}")
+                    print(f"保持する特殊トークン: {special_tokens_to_keep}")
+                    
+                    # トークンIDから文字列にデコード
+                    raw_text = self.processor.tokenizer.decode(
+                        generate_ids[0], 
+                        skip_special_tokens=False,  # まず特殊トークンを保持
+                        clean_up_tokenization_spaces=True
+                    )
+                    
+                    print(f"生のデコード結果（処理前）の長さ: {len(raw_text)}")
+                    
+                    # モデル固有のパターンでアシスタント応答を抽出
+                    # Llama 3.2 Vision のパターンを優先的に検索
+                    assistant_markers = [
+                        ("<|start_header_id|>assistant<|end_header_id|>", "<|eot_id|>"),
+                        ("<|im_start|>assistant", "<|im_end|>"),
+                        ("assistant:", "\n\n"),
+                        ("Assistant:", "\n"),
                     ]
                     
+                    # 応答抽出
                     extracted_text = None
-                    for prefix in assistant_prefix_patterns:
-                        if prefix in generated_text:
-                            assistant_start = generated_text.index(prefix) + len(prefix)
-                            # EOT_IDや他の終了マーカーがあれば削除
-                            for end_marker in ["<|eot_id|>", "<|end_of_text|>", "<|end_header_id|>", "<|im_end|>"]:
-                                if end_marker in generated_text[assistant_start:]:
-                                    assistant_end = generated_text.index(end_marker, assistant_start)
-                                    extracted_text = generated_text[assistant_start:assistant_end].strip()
-                                    break
-                            
-                            if extracted_text is None:
-                                extracted_text = generated_text[assistant_start:].strip()
-                            
+                    for start_marker, end_marker in assistant_markers:
+                        if start_marker in raw_text:
+                            start_idx = raw_text.find(start_marker) + len(start_marker)
+                            # 終了マーカーが見つかればそこまで、なければ最後まで
+                            if end_marker in raw_text[start_idx:]:
+                                end_idx = raw_text.find(end_marker, start_idx)
+                                extracted_text = raw_text[start_idx:end_idx].strip()
+                            else:
+                                extracted_text = raw_text[start_idx:].strip()
                             break
                     
-                    # アシスタントの回答を抽出できた場合は使用、できなかった場合は元のテキストを使用
-                    if extracted_text:
-                        generated_text = extracted_text
+                    # 抽出に失敗した場合の代替処理：seg トークンまでの全テキスト
+                    if not extracted_text and self.seg_token in raw_text:
+                        seg_idx = raw_text.find(self.seg_token)
+                        # セグメンテーショントークンの前のテキストを取得
+                        extracted_text = raw_text[:seg_idx].strip()
+                        # セグメンテーショントークンも含める
+                        extracted_text += f" {self.seg_token}"
                     
-                    # 残っている特殊トークンを除去（<seg>は保持）
-                    for token in ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<pad>"]:
-                        generated_text = generated_text.replace(token, "")
+                    # それでも抽出できなかった場合、生のテキストを使用
+                    if not extracted_text:
+                        extracted_text = raw_text
+                        print("警告: アシスタント応答の抽出に失敗しました。生テキストを使用します。")
                     
-                    # 複数の改行や空白を単一の改行に置換
-                    generated_text = re.sub(r'\n\s*\n', '\n\n', generated_text)
-                    generated_text = re.sub(r'\s+', ' ', generated_text).strip()
+                    # 最終的なクリーンアップ
+                    # 1. 特殊トークンの削除（<seg>は除く）
+                    # 2. HTML/XMLタグのような構造の削除
+                    # 3. 改行と空白の正規化
                     
-                    # <seg>トークンを保持
-                    # これはセグメンテーションの位置を示すための重要なトークン
-                    if self.seg_token not in generated_text and self.seg_token in generated_text.lower():
-                        # 大文字小文字を区別せずに検索し、元の形式を保持
-                        lower_text = generated_text.lower()
-                        seg_pos = lower_text.find(self.seg_token.lower())
-                        if seg_pos >= 0:
-                            generated_text = generated_text[:seg_pos] + self.seg_token + generated_text[seg_pos + len(self.seg_token):]
+                    # 1. 既知の特殊トークンを削除（<seg>は保持）
+                    special_tokens_to_remove = [
+                        "<|begin_of_text|>", "<|end_of_text|>", 
+                        "<|start_header_id|>", "<|end_header_id|>",
+                        "<|eot_id|>", "<|im_start|>", "<|im_end|>",
+                        "<|endoftext|>", "<pad>", "system", "user", "assistant"
+                    ]
+                    
+                    for token in special_tokens_to_remove:
+                        extracted_text = extracted_text.replace(token, "")
+                    
+                    # 2. HTMLタグ風の構造を削除（<xxx>形式、<seg>は除外）
+                    extracted_text = re.sub(r'<(?!seg\b)[^>]*>', '', extracted_text)
+                    
+                    # 3. 改行と空白の正規化
+                    extracted_text = re.sub(r'\n\s*\n', '\n\n', extracted_text)  # 複数改行→二重改行
+                    extracted_text = re.sub(r'\s+', ' ', extracted_text)  # 連続空白→単一空白
+                    extracted_text = extracted_text.strip()  # 前後の空白を削除
+                    
+                    # セグメンテーショントークンが処理中に消えていたら復元
+                    if self.seg_token not in extracted_text and raw_text.find(self.seg_token) != -1:
+                        # 元のテキストでの位置を参考に適切な位置に挿入
+                        # 文末に追加するのがシンプル
+                        extracted_text = extracted_text.rstrip() + f" {self.seg_token}"
+                        print(f"セグメンテーショントークン {self.seg_token} を復元しました")
+                    
+                    # 最終的なテキスト
+                    generated_text = extracted_text
                     
                     # 生成テキストの情報を表示
                     print(f"生成されたテキスト: 長さ={len(generated_text)}文字")
-                    print(f"生成テキストの先頭部分: {generated_text[:100]}...")
+                    if len(generated_text) > 100:
+                        print(f"生成テキストの先頭部分: {generated_text[:100]}...")
+                    else:
+                        print(f"生成テキスト全体: {generated_text}")
+                        
                 except Exception as decode_error:
                     print(f"テキストデコード中にエラー: {str(decode_error)}")
-                    generated_text = "生成テキストのデコードに失敗しました。"
+                    traceback_str = traceback.format_exc()
+                    print(f"詳細なトレースバック:\n{traceback_str}")
+                    
+                    # エラー回復：最低限のテキストを提供
+                    # seg_tokenだけは確実に含める
+                    generated_text = f"テキスト生成エラーが発生しました。{self.seg_token}"
                 
                 # セグメンテーショントークンの位置を検索
                 try:
