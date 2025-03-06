@@ -55,11 +55,12 @@ class LISAForCausalLM(nn.Module):
         self.ds_config = ds_config
         self.local_rank = local_rank
         
+        # SAMの画像サイズを初期化
+        self.sam_image_size = 1024
+        self.transform = None
+        
         # データ型の設定（GPUが利用可能であればfloat16、そうでなければfloat32）
         self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        
-        # SAM画像サイズの設定 (SAMのデフォルト入力サイズ)
-        self.sam_image_size = 1024
         
         # モデル初期化
         self.model = None
@@ -68,7 +69,6 @@ class LISAForCausalLM(nn.Module):
         
         # SAMモデルがある場合は初期化
         self.sam = None
-        self.transform = None  # ここで明示的にNoneで初期化
         self.initialize_lisa_modules(sam_checkpoint)
         
         # もしDeepSpeed用のds_configが指定されていなければ、ZeRO-2設定をデフォルトで作成
@@ -155,61 +155,84 @@ class LISAForCausalLM(nn.Module):
             
             # モデル構造に基づいて埋め込み層をリサイズ
             try:
-                # Mllamaの構造に適した埋め込み層へのアクセス方法
-                if hasattr(temp_model, "language_model"):
-                    input_embeddings = temp_model.language_model.model.embed_tokens
-                    output_embeddings = temp_model.lm_head
-                    print(f"リサイズ前: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                # 新しい語彙サイズを取得
+                new_vocab_size = len(self.processor.tokenizer)
+                print(f"リサイズ前: トークナイザサイズ={new_vocab_size}")
+                
+                # 入力埋め込み層のリサイズ
+                temp_model.resize_token_embeddings(new_vocab_size)
+                print(f"入力埋め込み層をリサイズしました: {new_vocab_size}")
+                
+                # 出力埋め込み層の手動リサイズ
+                if hasattr(temp_model, "get_output_embeddings") and temp_model.get_output_embeddings() is not None:
+                    old_embeddings = temp_model.get_output_embeddings()
+                    print(f"出力埋め込み層を取得: {old_embeddings}")
                     
-                    # 入力埋め込み層のリサイズ
-                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
-                    
-                    # 出力埋め込み層のリサイズ（必要な場合）
-                    if input_embeddings.weight.shape[0] != output_embeddings.weight.shape[0]:
-                        print("出力埋め込み層をリサイズします...")
-                        # 出力層のリサイズ
-                        old_lm_head = temp_model.get_output_embeddings()
-                        vocab_size_diff = len(self.processor.tokenizer) - old_lm_head.weight.shape[0]
+                    # 拡張された出力埋め込み層を作成
+                    old_num_tokens = old_embeddings.weight.shape[0]
+                    if old_num_tokens < new_vocab_size:
+                        print(f"出力埋め込み層をリサイズします: {old_num_tokens} -> {new_vocab_size}")
                         
-                        if vocab_size_diff > 0:
-                            print(f"出力層を拡張します: +{vocab_size_diff}トークン")
-                            new_lm_head_weight = torch.nn.Parameter(
-                                torch.cat([
-                                    old_lm_head.weight,
-                                    torch.zeros(vocab_size_diff, old_lm_head.weight.shape[1], 
-                                              device=old_lm_head.weight.device, 
-                                              dtype=old_lm_head.weight.dtype)
-                                ], dim=0)
-                            )
-                            # 平均で初期化
-                            with torch.no_grad():
-                                mean_weights = old_lm_head.weight.mean(dim=0, keepdim=True)
-                                new_lm_head_weight[-vocab_size_diff:] = mean_weights
-                            
-                            # 新しい出力層を設定
-                            old_lm_head.weight = new_lm_head_weight
-                            temp_model.set_output_embeddings(old_lm_head)
-                            print("出力埋め込み層のリサイズが完了しました")
-                
-                elif hasattr(temp_model, "model"):
-                    # 別の構造のMllamaモデルの場合
-                    print("異なるモデル構造を検出: model属性を使用")
-                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
-                
+                        # 新しい重みを作成
+                        old_weights = old_embeddings.weight.data
+                        new_weights = torch.zeros(
+                            (new_vocab_size, old_weights.shape[1]),
+                            dtype=old_weights.dtype,
+                            device=old_weights.device
+                        )
+                        new_weights[:old_num_tokens, :] = old_weights
+                        
+                        # 新しいトークン埋め込みを平均値で初期化
+                        if new_vocab_size > old_num_tokens:
+                            num_new_tokens = new_vocab_size - old_num_tokens
+                            mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
+                            new_weights[old_num_tokens:, :] = mean_weights
+                        
+                        # 出力埋め込み層の重みを更新
+                        old_embeddings.weight.data = new_weights
+                        print(f"出力埋め込み層のリサイズが完了しました: {new_weights.shape}")
                 else:
-                    print("未知のモデル構造です。標準的なリサイズを試みます")
-                    temp_model.resize_token_embeddings(len(self.processor.tokenizer))
+                    print("警告: 出力埋め込み層が見つからないか、アクセスできません")
+                    
+                    # text_modelにアクセスできるか確認
+                    if hasattr(temp_model, "text_model"):
+                        print("text_model経由で埋め込み層にアクセスを試みます")
+                        if hasattr(temp_model.text_model, "lm_head") and temp_model.text_model.lm_head is not None:
+                            lm_head = temp_model.text_model.lm_head
+                            old_num_tokens = lm_head.weight.shape[0]
+                            if old_num_tokens < new_vocab_size:
+                                print(f"text_model.lm_headをリサイズします: {old_num_tokens} -> {new_vocab_size}")
+                                # 同様のリサイズ処理...
+                                old_weights = lm_head.weight.data
+                                new_weights = torch.zeros(
+                                    (new_vocab_size, old_weights.shape[1]),
+                                    dtype=old_weights.dtype,
+                                    device=old_weights.device
+                                )
+                                new_weights[:old_num_tokens, :] = old_weights
+                                
+                                # 新しいトークン埋め込みを平均値で初期化
+                                if new_vocab_size > old_num_tokens:
+                                    num_new_tokens = new_vocab_size - old_num_tokens
+                                    mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
+                                    new_weights[old_num_tokens:, :] = mean_weights
+                                
+                                # 出力埋め込み層の重みを更新
+                                lm_head.weight.data = new_weights
+                                print(f"text_model.lm_headのリサイズが完了しました: {new_weights.shape}")
                 
-                # リサイズ後のサイズを確認
-                if hasattr(temp_model, "language_model"):
-                    input_embeddings = temp_model.language_model.model.embed_tokens
-                    output_embeddings = temp_model.lm_head
-                    print(f"リサイズ後: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                print(f"トークナイザサイズに合わせてモデルをリサイズしました: {new_vocab_size}")
             
             except Exception as resize_error:
                 print(f"埋め込み層のリサイズ中にエラーが発生しました: {str(resize_error)}")
                 print("警告: モデルは標準のトークナイザサイズのままです")
                 
+            # モデルをデバイスに移動（必要に応じて）
+            print("モデルを適切なデバイスに移動します")
+            if self.device is not None and not self.use_deepspeed:
+                temp_model = temp_model.to(self.device)
+                print(f"モデルを{self.device}に移動しました")
+            
             # 一時モデルの状態をチェックポイントとして保存
             print("リサイズしたモデルを一時チェックポイントとして保存します")
             temp_save_dir = "./temp_resized_model"
@@ -257,56 +280,100 @@ class LISAForCausalLM(nn.Module):
                 )
                 print("MllamaForConditionalGenerationを使用します")
                 
-                # リサイズ前にモデルの出力層と入力埋め込み層のサイズをチェック
-                if hasattr(self.model, "language_model"):
-                    input_embeddings = self.model.language_model.model.embed_tokens
-                    output_embeddings = self.model.lm_head
-                    print(f"リサイズ前: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
-                    
+                # デバッグ: モデル構造の詳細を出力
+                print("\n===== MllamaForConditionalGeneration モデル構造 =====")
+                print(f"モデルクラス: {type(self.model)}")
+                print(f"モデル属性一覧: {dir(self.model)}")
+                print(f"config属性: {self.model.config}")
+                if hasattr(self.model.config, "text_config"):
+                    print(f"text_config属性: {self.model.config.text_config}")
+                    print(f"text_config.hidden_size: {self.model.config.text_config.hidden_size}")
+                
+                # 埋め込み層の構造を確認
+                if hasattr(self.model, "get_input_embeddings"):
+                    print(f"入力埋め込み層: {self.model.get_input_embeddings()}")
+                if hasattr(self.model, "get_output_embeddings"):
+                    print(f"出力埋め込み層: {self.model.get_output_embeddings()}")
+                
+                # Mllamaモデルの構造を分析してトークナイザに合わせてリサイズ
+                print("Mllamaモデルの構造を分析中...")
+                
+                # 新しい語彙サイズを取得
+                new_vocab_size = len(self.processor.tokenizer)
+                print(f"リサイズ前: トークナイザサイズ={new_vocab_size}")
+                
+                try:
                     # 入力埋め込み層のリサイズ
-                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                    self.model.resize_token_embeddings(new_vocab_size)
+                    print(f"入力埋め込み層をリサイズしました: {new_vocab_size}")
                     
-                    # 出力埋め込み層のリサイズ（必要な場合）
-                    if input_embeddings.weight.shape[0] != output_embeddings.weight.shape[0]:
-                        print("出力埋め込み層をリサイズします...")
-                        # 出力層のリサイズ
-                        old_lm_head = self.model.get_output_embeddings()
-                        vocab_size_diff = len(self.processor.tokenizer) - old_lm_head.weight.shape[0]
+                    # 出力埋め込み層の手動リサイズ
+                    if hasattr(self.model, "get_output_embeddings") and self.model.get_output_embeddings() is not None:
+                        old_embeddings = self.model.get_output_embeddings()
+                        print(f"出力埋め込み層を取得: {old_embeddings}")
                         
-                        if vocab_size_diff > 0:
-                            print(f"出力層を拡張します: +{vocab_size_diff}トークン")
-                            new_lm_head_weight = torch.nn.Parameter(
-                                torch.cat([
-                                    old_lm_head.weight,
-                                    torch.zeros(vocab_size_diff, old_lm_head.weight.shape[1], 
-                                              device=old_lm_head.weight.device, 
-                                              dtype=old_lm_head.weight.dtype)
-                                ], dim=0)
-                            )
-                            # 平均で初期化
-                            with torch.no_grad():
-                                mean_weights = old_lm_head.weight.mean(dim=0, keepdim=True)
-                                new_lm_head_weight[-vocab_size_diff:] = mean_weights
+                        # 拡張された出力埋め込み層を作成
+                        old_num_tokens = old_embeddings.weight.shape[0]
+                        if old_num_tokens < new_vocab_size:
+                            print(f"出力埋め込み層をリサイズします: {old_num_tokens} -> {new_vocab_size}")
                             
-                            # 新しい出力層を設定
-                            old_lm_head.weight = new_lm_head_weight
-                            self.model.set_output_embeddings(old_lm_head)
-                            print("出力埋め込み層のリサイズが完了しました")
-                    
-                    # リサイズ後のサイズを確認
-                    input_embeddings = self.model.language_model.model.embed_tokens
-                    output_embeddings = self.model.lm_head
-                    print(f"リサイズ後: 入力埋め込みサイズ={input_embeddings.weight.shape[0]}, 出力埋め込みサイズ={output_embeddings.weight.shape[0]}")
+                            # 新しい重みを作成
+                            old_weights = old_embeddings.weight.data
+                            new_weights = torch.zeros(
+                                (new_vocab_size, old_weights.shape[1]),
+                                dtype=old_weights.dtype,
+                                device=old_weights.device
+                            )
+                            new_weights[:old_num_tokens, :] = old_weights
+                            
+                            # 新しいトークン埋め込みを平均値で初期化
+                            if new_vocab_size > old_num_tokens:
+                                num_new_tokens = new_vocab_size - old_num_tokens
+                                mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
+                                new_weights[old_num_tokens:, :] = mean_weights
+                            
+                            # 出力埋め込み層の重みを更新
+                            old_embeddings.weight.data = new_weights
+                            print(f"出力埋め込み層のリサイズが完了しました: {new_weights.shape}")
+                    else:
+                        print("警告: 出力埋め込み層が見つからないか、アクセスできません")
+                        
+                        # text_modelにアクセスできるか確認
+                        if hasattr(self.model, "text_model"):
+                            print("text_model経由で埋め込み層にアクセスを試みます")
+                            if hasattr(self.model.text_model, "lm_head") and self.model.text_model.lm_head is not None:
+                                lm_head = self.model.text_model.lm_head
+                                old_num_tokens = lm_head.weight.shape[0]
+                                if old_num_tokens < new_vocab_size:
+                                    print(f"text_model.lm_headをリサイズします: {old_num_tokens} -> {new_vocab_size}")
+                                    # 同様のリサイズ処理...
+                                    old_weights = lm_head.weight.data
+                                    new_weights = torch.zeros(
+                                        (new_vocab_size, old_weights.shape[1]),
+                                        dtype=old_weights.dtype,
+                                        device=old_weights.device
+                                    )
+                                    new_weights[:old_num_tokens, :] = old_weights
+                                    
+                                    # 新しいトークン埋め込みを平均値で初期化
+                                    if new_vocab_size > old_num_tokens:
+                                        num_new_tokens = new_vocab_size - old_num_tokens
+                                        mean_weights = old_weights.mean(dim=0).unsqueeze(0).expand(num_new_tokens, -1)
+                                        new_weights[old_num_tokens:, :] = mean_weights
+                                    
+                                    # 出力埋め込み層の重みを更新
+                                    lm_head.weight.data = new_weights
+                                    print(f"text_model.lm_headのリサイズが完了しました: {new_weights.shape}")
+                except Exception as e:
+                    print(f"埋め込み層のリサイズ中にエラーが発生しました: {str(e)}")
+                    print("警告: モデルは標準のトークナイザサイズのままです")
                 
-                else:
-                    print("異なるモデル構造を検出: 標準的なリサイズを試みます")
-                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
-                
-                # デバイスに移動
+                # モデルをデバイスに移動
                 self.model = self.model.to(self.device)
-                
+            
             except Exception as e:
-                print(f"MllamaForConditionalGenerationの使用に失敗: {str(e)}")
+                print(f"モデル初期化エラー: {str(e)}")
+                print("AutoModelForCausalLMにフォールバックします")
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     trust_remote_code=True,
@@ -347,15 +414,69 @@ class LISAForCausalLM(nn.Module):
         print(f"損失計算から除外される特殊トークンIDs: {self.special_token_ids}")
 
     def initialize_lisa_modules(self, sam_checkpoint=None):
+        """LISAの追加モジュールを初期化
+        
+        Args:
+            sam_checkpoint: SAMモデルのチェックポイントパス（任意）
         """
-        LISAの追加モジュール（SAMなど）を初期化
-        """
-        # SAMのデフォルト画像サイズが設定されていない場合は初期化
-        if not hasattr(self, 'sam_image_size'):
+        print("\n=== LISAモジュールの初期化 ===")
+        
+        # デフォルトのSAM画像サイズを設定（まだ設定されていない場合）
+        if not hasattr(self, "sam_image_size"):
             self.sam_image_size = 1024
-            print(f"sam_image_sizeが設定されていなかったので、デフォルト値({self.sam_image_size})を設定しました。")
+            print(f"sam_image_sizeを{self.sam_image_size}に設定しました")
             
-        # SAMモデルとtransformの初期化
+        # モデルのLLM次元を取得
+        print("LLMの隠れ層次元を取得します...")
+        try:
+            config = getattr(self.model, "config", None)
+            llm_hidden_size = None
+            
+            # configがMllamaConfigの場合
+            if hasattr(config, "text_config"):
+                print("Mllamaモデル構造を検出: config.text_configが存在します")
+                text_config = config.text_config
+                if hasattr(text_config, "hidden_size"):
+                    llm_hidden_size = text_config.hidden_size
+                    print(f"Mllamaのtext_config.hidden_size: {llm_hidden_size}")
+            # 通常のLLMの場合
+            elif hasattr(config, "hidden_size"):
+                llm_hidden_size = config.hidden_size
+                print(f"標準のconfig.hidden_size: {llm_hidden_size}")
+            # configが辞書の場合
+            elif isinstance(config, dict):
+                if "text_config" in config and "hidden_size" in config["text_config"]:
+                    llm_hidden_size = config["text_config"]["hidden_size"]
+                    print(f"config辞書からtext_config.hidden_size: {llm_hidden_size}")
+                elif "hidden_size" in config:
+                    llm_hidden_size = config["hidden_size"]
+                    print(f"config辞書からhidden_size: {llm_hidden_size}")
+            
+            # hidden_sizeが取得できなかった場合
+            if llm_hidden_size is None:
+                print("警告: モデルからhidden_sizeを取得できませんでした")
+                # モデル構造を詳細に分析して手がかりを探す
+                print("モデル構造を分析して次元を特定します...")
+                
+                if hasattr(self.model, "text_model") and hasattr(self.model.text_model, "config"):
+                    text_model_config = self.model.text_model.config
+                    if hasattr(text_model_config, "hidden_size"):
+                        llm_hidden_size = text_model_config.hidden_size
+                        print(f"text_model.config.hidden_size: {llm_hidden_size}")
+                
+                # それでも見つからない場合はデフォルト値を使用
+                if llm_hidden_size is None:
+                    llm_hidden_size = 4096  # デフォルト値
+                    print(f"隠れ層次元が特定できないためデフォルト値を使用: {llm_hidden_size}")
+            
+            print(f"LLMの隠れ層次元: {llm_hidden_size}")
+            
+        except Exception as e:
+            print(f"hidden_size取得中にエラーが発生: {str(e)}")
+            llm_hidden_size = 4096  # エラー時のデフォルト値
+            print(f"エラーによりデフォルトの隠れ層次元を使用: {llm_hidden_size}")
+        
+        # SAMモデルを初期化（以下の部分は変更なし）
         if sam_checkpoint:
             print(f"SAMチェックポイント: {sam_checkpoint}")
             try:
@@ -384,51 +505,9 @@ class LISAForCausalLM(nn.Module):
                 print(f"SAM画像リサイズ変換を初期化しました（サイズ: {self.sam.image_encoder.img_size}）")
                 
                 # テキスト->SAMプロンプト投影（Llama 3.2 Visionの隠れ状態次元から256次元へ）
-                # Llama 3.2 Visionのhidden_sizeはtext_configのhidden_sizeから取得
-                try:
-                    # DeepSpeedを使用している場合
-                    if self.use_deepspeed:
-                        # DeepSpeedモデルのconfigアクセス方法
-                        if hasattr(self.model, "module"):
-                            if hasattr(self.model.module, "config"):
-                                # configオブジェクトを取得
-                                config = self.model.module.config
-
-                                # Mllamaモデルの場合の特殊な対応
-                                if hasattr(config, "text_config"):
-                                    hidden_size = config.text_config.hidden_size
-                                    print(
-                                        f"text_configからhidden_size取得: {hidden_size}")
-                                else:
-                                    # dictの場合やtext_configが存在しない場合の対応
-                                    if isinstance(
-                                        config, dict) and "text_config" in config:
-                                        hidden_size = config["text_config"]["hidden_size"]
-                                        print(
-                                            f"text_config dictからhidden_size取得: {hidden_size}")
-                                    else:
-                                        # フォールバック: 一般的なサイズを使用
-                                        print(
-                                            "警告: モデル設定からhidden_sizeを取得できません。デフォルト値4096を使用します。")
-                                        hidden_size = 4096  # Llama-3.2の一般的なサイズ
-                            else:
-                                print(
-                                    "警告: モデルmoduleにconfigがありません。デフォルト値4096を使用します。")
-                                hidden_size = 4096
-                        else:
-                            print("警告: モデルにmodule属性がありません。デフォルト値4096を使用します。")
-                            hidden_size = 4096
-                    else:
-                        # 通常のモデル
-                        hidden_size = self.model.config.text_config.hidden_size
-                except Exception as e:
-                    print(f"hidden_size取得中にエラー発生: {e}")
-                    print("デフォルト値4096を使用します")
-                    hidden_size = 4096  # フォールバック値
-
-                # セグメンテーション投影を初期化
-                print(f"セグメンテーション投影を初期化: {hidden_size} -> 256")
-                self.seg_projection = nn.Linear(hidden_size, 256)
+                # すでに取得したllm_hidden_sizeを使用
+                print(f"セグメンテーション投影を初期化: {llm_hidden_size} -> 256")
+                self.seg_projection = nn.Linear(llm_hidden_size, 256)
 
                 # セグメンテーション投影もGPUに移動
                 self.seg_projection.to(self.device, self.dtype)
