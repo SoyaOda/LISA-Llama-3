@@ -1210,6 +1210,7 @@ class LISAForCausalLM(nn.Module):
                 return {"masks": [], "text": f"入力処理エラー: {str(process_error)}"}
             
             # 最終的な結果を返す
+            print(f"生成されたテキスト(LISA内部): 長さ={len(generated_text)}文字, 先頭部分={generated_text[:50]}...")
             return {"masks": masks, "text": generated_text}
             
         except Exception as e:

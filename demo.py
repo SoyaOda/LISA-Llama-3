@@ -343,6 +343,17 @@ def main(args):
                 masks = result.get('masks', [])
                 text = result.get('text', '')
                 
+                # テキスト内容をデバッグ表示
+                print(f"生成テキストの長さ: {len(text)} 文字")
+                print(f"生成テキストの先頭部分: {text[:100]}...")
+                
+                # テキストを別ファイルに保存
+                if text:
+                    text_output_path = os.path.join(args.output_dir, f"text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                    with open(text_output_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    print(f"生成テキストを保存しました: {text_output_path}")
+                
                 # 結果の可視化と保存
                 output_path = os.path.join(args.output_dir, f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
                 visualize_results(image, masks, text, output_path)
