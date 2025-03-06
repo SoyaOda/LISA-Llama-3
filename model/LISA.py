@@ -65,11 +65,10 @@ class LISAForCausalLM(nn.Module):
         self.model = None
         self.processor = None
         self.initialize_llama(model_path)
-        # transformの初期化はSAMモデルが利用可能になった後に行うため、ここでは行わない
-        # self.transform = ResizeLongestSide(self.sam_image_size)
         
         # SAMモデルがある場合は初期化
         self.sam = None
+        self.transform = None  # ここで明示的にNoneで初期化
         self.initialize_lisa_modules(sam_checkpoint)
         
         # もしDeepSpeed用のds_configが指定されていなければ、ZeRO-2設定をデフォルトで作成
@@ -351,6 +350,11 @@ class LISAForCausalLM(nn.Module):
         """
         LISAの追加モジュール（SAMなど）を初期化
         """
+        # SAMのデフォルト画像サイズが設定されていない場合は初期化
+        if not hasattr(self, 'sam_image_size'):
+            self.sam_image_size = 1024
+            print(f"sam_image_sizeが設定されていなかったので、デフォルト値({self.sam_image_size})を設定しました。")
+            
         # SAMモデルとtransformの初期化
         if sam_checkpoint:
             print(f"SAMチェックポイント: {sam_checkpoint}")
@@ -453,8 +457,13 @@ class LISAForCausalLM(nn.Module):
         Returns:
             transform: ResizeLongestSideオブジェクト
         """
+        # SAMのデフォルト画像サイズが設定されていない場合は初期化
+        if not hasattr(self, 'sam_image_size'):
+            self.sam_image_size = 1024
+            print(f"transform_image: sam_image_sizeが設定されていなかったので、デフォルト値({self.sam_image_size})を設定しました。")
+            
         # SAM用のリサイズ変換を作成
-        transform = ResizeLongestSide(target_length=1024)
+        transform = ResizeLongestSide(target_length=self.sam_image_size)
         return transform
 
     def preprocess_sam_image(self, image):
