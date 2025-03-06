@@ -1054,6 +1054,30 @@ class LISAForCausalLM(nn.Module):
                                             sparse_embeddings = self.dim_adjustment(sparse_embeddings)
                                             print(f"調整後のsparse_embeddings: 形状={sparse_embeddings.shape}")
                                         
+                                        # image_peを適切なデバイスと型に移動
+                                        image_pe = image_pe.to(device=sparse_embeddings.device, dtype=sparse_embeddings.dtype)
+                                        
+                                        # テンソルのサイズを表示して確認
+                                        print(f"image_peのシェイプ: {image_pe.shape}")
+                                        print(f"sam_image_embeddingのシェイプ: {sam_image_embedding.shape}")
+                                        
+                                        # image_peの形状をsam_image_embeddingに合わせてリサイズ
+                                        if image_pe.shape[0] != sam_image_embedding.shape[2] or image_pe.shape[2] != sam_image_embedding.shape[3]:
+                                            print(f"image_peをリサイズします: {image_pe.shape} -> ({sam_image_embedding.shape[2]}, {sam_image_embedding.shape[3]})")
+                                            # F.interpolateはBCHW形式を期待するので、次元を調整
+                                            # [H, C, W] -> [1, C, H, W]に変換
+                                            image_pe_reshaped = image_pe.permute(1, 0, 2).unsqueeze(0)
+                                            # リサイズ実行
+                                            image_pe_resized = F.interpolate(
+                                                image_pe_reshaped,
+                                                size=(sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
+                                                mode="bilinear",
+                                                align_corners=False
+                                            )
+                                            # [1, C, H, W] -> [H, C, W]に戻す
+                                            image_pe = image_pe_resized.squeeze(0).permute(1, 0, 2)
+                                            print(f"リサイズ後のimage_peのシェイプ: {image_pe.shape}")
+                                        
                                         # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
                                         # [B, C, H, W]形式のゼロテンソルを作成
                                         # 画像埋め込みから適切な形状を取得
@@ -1065,13 +1089,23 @@ class LISAForCausalLM(nn.Module):
                                         )
                                         
                                         # SAMモデルでマスクを予測
-                                        masks_predictions, scores, logits = self.sam.mask_decoder(
-                                            image_embeddings=sam_image_embedding,
-                                            image_pe=image_pe,
-                                            sparse_prompt_embeddings=sparse_embeddings,
-                                            dense_prompt_embeddings=dense_prompt_embeddings,
-                                            multimask_output=False,
-                                        )
+                                        try:
+                                            masks_predictions, scores, logits = self.sam.mask_decoder(
+                                                image_embeddings=sam_image_embedding,
+                                                image_pe=image_pe,
+                                                sparse_prompt_embeddings=sparse_embeddings,
+                                                dense_prompt_embeddings=dense_prompt_embeddings,
+                                                multimask_output=False,
+                                            )
+                                            print("マスク予測成功！")
+                                        except Exception as e:
+                                            print(f"マスクデコーダーでのエラー詳細: {e}")
+                                            # 各テンソルの形状とデバイスを詳細にデバッグ出力
+                                            print(f"image_embeddings: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}, 型={sam_image_embedding.dtype}")
+                                            print(f"image_pe: 形状={image_pe.shape}, デバイス={image_pe.device}, 型={image_pe.dtype}")
+                                            print(f"sparse_prompt_embeddings: 形状={sparse_embeddings.shape}, デバイス={sparse_embeddings.device}, 型={sparse_embeddings.dtype}")
+                                            print(f"dense_prompt_embeddings: 形状={dense_prompt_embeddings.shape}, デバイス={dense_prompt_embeddings.device}, 型={dense_prompt_embeddings.dtype}")
+                                            raise e
                                         
                                         # マスク予測結果がNaNまたはInfを含んでいないか確認
                                         if torch.isnan(masks_predictions).any() or torch.isinf(masks_predictions).any():

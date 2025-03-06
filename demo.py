@@ -246,6 +246,15 @@ def visualize_results(image, masks, text, output_path):
                 mask = cv2.resize(mask.astype(np.float32), (img_w, img_h), interpolation=cv2.INTER_LINEAR)
                 mask = (mask > 0.5).astype(np.float32)  # 閾値を適用して2値化
             
+            # 次元数が一致していない場合の対応（3次元マスクを2次元に変換）
+            if len(mask.shape) > 2:
+                if mask.shape[0] == 1:  # バッチ次元が含まれている場合
+                    mask = mask[0]  # 最初の次元を削除
+                if len(mask.shape) > 2:  # まだ2次元以上の場合
+                    print(f"マスクの次元が多すぎます: {mask.shape}、次元を圧縮します")
+                    # 値が存在する場所をすべて1に設定（任意の次元から2次元マスクを作成）
+                    mask = (mask.sum(axis=tuple(range(len(mask.shape)-2))) > 0).astype(np.float32)
+            
             # Create a blended visualization
             vis_image = np.array(image).copy()
             mask_colored = np.zeros_like(vis_image, dtype=np.uint8)
