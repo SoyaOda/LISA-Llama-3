@@ -7,6 +7,10 @@
 export DEEPSPEED_LOGGER_LEVEL=1
 export DS_ACCELERATOR=cuda       # 明示的にアクセラレータを設定
 
+# CUDAカーネルエラーの詳細なトレース情報を取得するための設定
+# CUDA操作を同期的に実行し、エラー発生時に正確な位置を特定可能にする
+export CUDA_LAUNCH_BLOCKING=1
+
 # 使用可能なGPUの数を取得
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "利用可能なGPU数: ${NUM_GPUS}"
