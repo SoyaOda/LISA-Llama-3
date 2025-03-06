@@ -1030,12 +1030,12 @@ class LISAForCausalLM(nn.Module):
                                     # 画像特徴マップがdeviceと一致していることを確認
                                     sam_image_embedding = sam_image_embedding.to(prompt_embedding.device)
                                     
+                                    # プロンプト埋め込みの形状調整
+                                    # SAMモデルが期待する形式に変換 - [1, 1, 256]の形状にする
+                                    sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
+                                    print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
+                                    
                                     try:
-                                        # プロンプト埋め込みの形状調整
-                                        # SAMモデルが期待する形式に変換 - [1, 1, 256]の形状にする
-                                        sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
-                                        print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
-                                        
                                         # 位置エンコーディングの形状を取得
                                         image_pe = self.sam.prompt_encoder.get_dense_pe()
                                         
@@ -1060,110 +1060,135 @@ class LISAForCausalLM(nn.Module):
                                         # テンソルのサイズを表示して確認
                                         print(f"image_peのシェイプ: {image_pe.shape}")
                                         print(f"sam_image_embeddingのシェイプ: {sam_image_embedding.shape}")
-                                        
+                                    except Exception as pe_error:
+                                        print(f"位置エンコーディング処理エラー: {pe_error}")
+                                        # エラー時は処理を続行し、後続のマスク生成部分でも適切に対応できるようにする
+                                    
+                                    try:
                                         # image_peの形状をsam_image_embeddingに合わせてリサイズ
-                                        if image_pe.shape[0] != sam_image_embedding.shape[2] or image_pe.shape[2] != sam_image_embedding.shape[3]:
+                                        if 'image_pe' in locals() and image_pe.shape[2] != sam_image_embedding.shape[2] or image_pe.shape[3] != sam_image_embedding.shape[3]:
                                             print(f"image_peをリサイズします: {image_pe.shape} -> ({sam_image_embedding.shape[2]}, {sam_image_embedding.shape[3]})")
-                                            # F.interpolateはBCHW形式を期待するので、次元を調整
-                                            # [H, C, W] -> [1, C, H, W]に変換
-                                            image_pe_reshaped = image_pe.permute(1, 0, 2).unsqueeze(0)
+                                            
                                             # リサイズ実行
-                                            image_pe_resized = F.interpolate(
-                                                image_pe_reshaped,
-                                                size=(sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
-                                                mode="bilinear",
-                                                align_corners=False
-                                            )
-                                            # [1, C, H, W] -> [H, C, W]に戻す
-                                            image_pe = image_pe_resized.squeeze(0).permute(1, 0, 2)
-                                            print(f"リサイズ後のimage_peのシェイプ: {image_pe.shape}")
+                                            try:
+                                                image_pe_resized = F.interpolate(
+                                                    image_pe,
+                                                    size=(sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
+                                                    mode="bilinear",
+                                                    align_corners=False
+                                                )
+                                                image_pe = image_pe_resized
+                                                print(f"リサイズ後のimage_peのシェイプ: {image_pe.shape}")
+                                            except Exception as resize_error:
+                                                print(f"画像リサイズエラー: {resize_error}")
+                                                print("代替のリサイズ方法を試みます...")
+                                                
+                                                # 代替方法: 元のimage_peの寸法を使用して新しいサイズのテンソルを作成
+                                                try:
+                                                    # 新しいテンソルを作成し、双線形補間で値をコピー
+                                                    new_image_pe = torch.zeros(
+                                                        (image_pe.shape[0], image_pe.shape[1], 
+                                                         sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
+                                                        device=image_pe.device,
+                                                        dtype=image_pe.dtype
+                                                    )
+                                                    
+                                                    # 元の値を新しいテンソルにコピー（簡易的な方法）
+                                                    # 実際には双線形補間などが適しているが、簡易的なサイズ調整として
+                                                    for i in range(sam_image_embedding.shape[2]):
+                                                        for j in range(sam_image_embedding.shape[3]):
+                                                            # インデックスを正規化して元の位置を計算
+                                                            orig_i = int(i * image_pe.shape[2] / sam_image_embedding.shape[2])
+                                                            orig_j = int(j * image_pe.shape[3] / sam_image_embedding.shape[3])
+                                                            # 境界チェック
+                                                            orig_i = min(orig_i, image_pe.shape[2] - 1)
+                                                            orig_j = min(orig_j, image_pe.shape[3] - 1)
+                                                            # 値をコピー
+                                                            new_image_pe[:, :, i, j] = image_pe[:, :, orig_i, orig_j]
+                                                    
+                                                    image_pe = new_image_pe
+                                                    print(f"手動リサイズ後のimage_peのシェイプ: {image_pe.shape}")
+                                                except Exception as manual_resize_error:
+                                                    print(f"手動リサイズ失敗: {manual_resize_error}")
+                                                    # 最終手段：元のサイズを使用
+                                                    print("警告: 位置エンコーディングのリサイズに失敗しました。元のサイズを使用します。")
+                                    except Exception as resize_outer_error:
+                                        print(f"画像リサイズ全体のエラー: {resize_outer_error}")
+                                        # エラー時も処理を続行
+
+                                # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
+                                # [B, C, H, W]形式のゼロテンソルを作成
+                                # 画像埋め込みから適切な形状を取得
+                                b, c, h, w = sam_image_embedding.shape
+                                dense_prompt_embeddings = torch.zeros(
+                                    (b, c, h, w), 
+                                    device=sam_image_embedding.device, 
+                                    dtype=sam_image_embedding.dtype
+                                )
+                                
+                                # SAMモデルでマスクを予測
+                                try:
+                                    masks_predictions, scores, logits = self.sam.mask_decoder(
+                                        image_embeddings=sam_image_embedding,
+                                        image_pe=image_pe,
+                                        sparse_prompt_embeddings=sparse_embeddings,
+                                        dense_prompt_embeddings=dense_prompt_embeddings,
+                                        multimask_output=False,
+                                    )
+                                    print("マスク予測成功！")
+                                    
+                                    # マスク予測結果がNaNまたはInfを含んでいないか確認
+                                    if torch.isnan(masks_predictions).any() or torch.isinf(masks_predictions).any():
+                                        print("警告: マスク予測にNaNまたはInf値が含まれています。0に置き換えます。")
+                                        masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
+                                    
+                                    # マスクを一時的に1024x1024サイズにリサイズ
+                                    mask_1024 = F.interpolate(
+                                        masks_predictions,
+                                        size=(self.sam_image_size, self.sam_image_size),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    
+                                    # 入力画像の元のサイズ（前処理前）を取得
+                                    if hasattr(self, 'original_image_size'):
+                                        orig_h, orig_w = self.original_image_size
+                                        print(f"マスクをオリジナル画像サイズ ({orig_h}, {orig_w}) にリサイズします")
                                         
-                                        # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
-                                        # [B, C, H, W]形式のゼロテンソルを作成
-                                        # 画像埋め込みから適切な形状を取得
-                                        b, c, h, w = sam_image_embedding.shape
-                                        dense_prompt_embeddings = torch.zeros(
-                                            (b, c, h, w), 
-                                            device=sam_image_embedding.device, 
-                                            dtype=sam_image_embedding.dtype
-                                        )
-                                        
-                                        # SAMモデルでマスクを予測
-                                        try:
-                                            masks_predictions, scores, logits = self.sam.mask_decoder(
-                                                image_embeddings=sam_image_embedding,
-                                                image_pe=image_pe,
-                                                sparse_prompt_embeddings=sparse_embeddings,
-                                                dense_prompt_embeddings=dense_prompt_embeddings,
-                                                multimask_output=False,
-                                            )
-                                            print("マスク予測成功！")
-                                        except Exception as e:
-                                            print(f"マスクデコーダーでのエラー詳細: {e}")
-                                            # 各テンソルの形状とデバイスを詳細にデバッグ出力
-                                            print(f"image_embeddings: 形状={sam_image_embedding.shape}, デバイス={sam_image_embedding.device}, 型={sam_image_embedding.dtype}")
-                                            print(f"image_pe: 形状={image_pe.shape}, デバイス={image_pe.device}, 型={image_pe.dtype}")
-                                            print(f"sparse_prompt_embeddings: 形状={sparse_embeddings.shape}, デバイス={sparse_embeddings.device}, 型={sparse_embeddings.dtype}")
-                                            print(f"dense_prompt_embeddings: 形状={dense_prompt_embeddings.shape}, デバイス={dense_prompt_embeddings.device}, 型={dense_prompt_embeddings.dtype}")
-                                            raise e
-                                        
-                                        # マスク予測結果がNaNまたはInfを含んでいないか確認
-                                        if torch.isnan(masks_predictions).any() or torch.isinf(masks_predictions).any():
-                                            print("警告: マスク予測にNaNまたはInf値が含まれています。0に置き換えます。")
-                                            masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
-                                        
-                                        # マスクを一時的に1024x1024サイズにリサイズ
-                                        mask_1024 = F.interpolate(
+                                        # マスクを元の画像サイズにリサイズ
+                                        mask = F.interpolate(
                                             masks_predictions,
-                                            size=(self.sam_image_size, self.sam_image_size),
+                                            size=(orig_h, orig_w),
                                             mode="bilinear",
                                             align_corners=False,
                                         )
-                                        
-                                        # 入力画像の元のサイズ（前処理前）を取得
-                                        if hasattr(self, 'original_image_size'):
-                                            orig_h, orig_w = self.original_image_size
-                                            print(f"マスクをオリジナル画像サイズ ({orig_h}, {orig_w}) にリサイズします")
-                                            
-                                            # マスクを元の画像サイズにリサイズ
-                                            mask = F.interpolate(
-                                                masks_predictions,
-                                                size=(orig_h, orig_w),
-                                                mode="bilinear",
-                                                align_corners=False,
-                                            )
-                                        else:
-                                            print("警告: オリジナル画像サイズ情報がありません。デフォルトサイズを使用します。")
-                                            mask = mask_1024
-                                        
-                                        # マスクのシグモイド活性化と閾値処理
-                                        mask = torch.sigmoid(mask) > 0.5
-
-                                        # マスク情報をリストに追加 - ただし辞書ではなく直接マスク配列を追加
-                                        masks.append(mask.cpu().numpy())
-                                        print(f"マスク生成成功: 形状={mask.shape}, 型={type(mask)}")
+                                    else:
+                                        print("警告: オリジナル画像サイズ情報がありません。デフォルトサイズを使用します。")
+                                        mask = mask_1024
                                     
-                                    except Exception as mask_error:
-                                        print(f"マスク生成中にエラー: {str(mask_error)}")
-                                        # エラー時のフォールバック: ダミーマスクを生成
+                                    # マスクのシグモイド活性化と閾値処理
+                                    mask = torch.sigmoid(mask) > 0.5
+                                    
+                                    # マスク情報をリストに追加
+                                    masks.append(mask.cpu().numpy()[0, 0])
+                                    print(f"マスク生成成功: 形状={mask.shape}")
+                                    
+                                except Exception as e:
+                                    print(f"マスク生成中にエラー: {e}")
+                                    
+                                    # オリジナル画像サイズが設定されている場合、そのサイズでダミーマスクを生成
+                                    if hasattr(self, 'original_image_size'):
+                                        h, w = self.original_image_size
+                                        print(f"オリジナルサイズ ({h}x{w}) のダミーマスクを生成")
+                                        dummy_mask = np.zeros((h, w), dtype=np.float32)
                                         
-                                        # 元の画像サイズがある場合はそれに合わせる
-                                        if hasattr(self, 'original_image_size'):
-                                            mask_h, mask_w = self.original_image_size
-                                            print(f"オリジナルサイズ ({mask_h}x{mask_w}) のダミーマスクを生成")
-                                            dummy_mask = np.zeros((mask_h, mask_w), dtype=np.float32)
-                                        else:
-                                            # デフォルトサイズのダミーマスク
-                                            print(f"ダミーマスク生成: 形状=({self.sam_image_size}, {self.sam_image_size})")
-                                            dummy_mask = np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.float32)
-                                        
-                                        # 中央部分に小さな円形のマスクを作成（視覚的に確認しやすいように）
-                                        center_h, center_w = dummy_mask.shape[0] // 2, dummy_mask.shape[1] // 2
-                                        radius = min(dummy_mask.shape[0], dummy_mask.shape[1]) // 8
-                                        
-                                        y, x = np.ogrid[:dummy_mask.shape[0], :dummy_mask.shape[1]]
-                                        dist_from_center = np.sqrt((y - center_h)**2 + (x - center_w)**2)
-                                        dummy_mask[dist_from_center <= radius] = 1.0
+                                        # ダミーマスクに円を追加して視覚的に確認しやすくする
+                                        center_y, center_x = h // 2, w // 2
+                                        radius = min(h, w) // 4
+                                        y, x = np.ogrid[:h, :w]
+                                        dist_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+                                        circle_mask = dist_from_center <= radius
+                                        dummy_mask[circle_mask] = 1.0
                                         
                                         masks.append(dummy_mask)
                                         print(f"ダミーマスク生成完了: 形状={dummy_mask.shape}")
