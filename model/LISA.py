@@ -18,6 +18,8 @@ import shutil
 import torch.distributed as dist
 import re
 import traceback
+import io
+import base64
 
 
 class LISAForCausalLM(nn.Module):
@@ -748,135 +750,76 @@ class LISAForCausalLM(nn.Module):
             # 画像が有効な形式かチェック
             image_pil = check_image(image)
 
+            # 画像サイズを記録（後でマスクのリサイズに使用）
+            self.original_image_size = (image_pil.height, image_pil.width)
+            print(f"オリジナル画像サイズ: {self.original_image_size}")
+
             # SAMモデル用の画像埋め込みを生成
             sam_image_embedding = self.preprocess_sam_image(image_pil)
             print(f"SAM画像埋め込みのシェイプ: {sam_image_embedding.shape}")
 
-            # サンプリングパラメータの準備
-            generation_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "repetition_penalty": repetition_penalty,
-                "do_sample": do_sample,
-            }
-            
-            # 温度パラメータを設定（0より大きい場合のみ）
-            if temperature is not None and temperature > 0:
-                generation_kwargs["temperature"] = temperature
-            
-            # top_pパラメータを設定
-            if top_p is not None and 0 < top_p <= 1.0:
-                generation_kwargs["top_p"] = top_p
-            
-            # top_kパラメータを設定
-            if top_k is not None and top_k > 0:
-                generation_kwargs["top_k"] = top_k
-                print(f"使用するtop_k値: {top_k}")
-            
-            # ビームサーチを使用する場合
-            if num_beams is not None and num_beams > 1:
-                generation_kwargs["num_beams"] = num_beams
-                print(f"ビームサーチを使用: ビーム数={num_beams}")
-
-            # チャットメッセージの構成
-            # Llama 3.2 Vision の推奨プロンプト形式を使用
             # プロンプトの言語を検出
             is_japanese = any(ord(c) > 127 for c in prompt)
             is_english = not is_japanese
             
-            # プロンプト言語によってシステムプロンプトを選択
+            # 日本語プロンプトの場合、明示的に日本語で回答するよう指示を追加
             if is_japanese:
+                if "<seg>" in prompt:
+                    # <seg>トークンの位置を保持
+                    seg_pos = prompt.find("<seg>")
+                    # <seg>の前にだけ指示を追加
+                    prompt = prompt[:seg_pos] + "必ず日本語で詳しく答えてください。 " + prompt[seg_pos:]
+                else:
+                    prompt = prompt + " 必ず日本語で詳しく答えてください。"
+                
                 system_content = "あなたは画像理解に優れた高性能AIアシスタントです。ユーザーの質問に対して、画像の内容を詳しく分析し、日本語で明確かつ詳細に回答してください。特に人物や物体の特徴、位置関係、色彩などを具体的に説明することを心がけてください。"
             else:
-                system_content = "You are a highly capable AI assistant specialized in image understanding. Analyze the content of images carefully and provide clear, detailed responses to user questions. Focus on describing features, spatial relationships, and visual elements accurately."
-
-            # マルチモーダル会話用のメッセージ構造
-            # マルチモーダル対応LLMはシステムメッセージなしの構造が推奨される場合がある
-            # まず推奨形式（システムメッセージなし）を試し、失敗した場合のみシステムメッセージを追加
+                system_content = "You are a helpful vision-language assistant that understands images and text. Analyze the image carefully and provide clear, detailed explanations."
+            
+            # Llama 3.2 Visionの推奨プロンプト形式を使用
             try:
-                # システムメッセージなしでまず試行
-                simple_messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": prompt}
-                        ]
-                    }
+                # ユーザーメッセージのみの形式
+                messages = [
+                    {"role": "user", "content": [
+                        {"type": "image", "source": {"data": "data:image/jpeg;base64," + image_to_base64(image_pil), "width": image_pil.width, "height": image_pil.height}},
+                        {"type": "text", "text": prompt}
+                    ]}
                 ]
                 
+                # モデルに合ったチャットテンプレートを適用
                 input_text = self.processor.apply_chat_template(
-                    simple_messages,
+                    messages,
                     add_generation_prompt=True,
-                    return_tensors=None  # テキストを返す
+                    tokenize=False
                 )
-                print("システムメッセージなしのシンプルなチャットテンプレートを適用しました")
-            except Exception as simple_template_error:
-                print(f"シンプルテンプレート適用エラー: {simple_template_error}")
-                try:
-                    # システムメッセージを含めて再試行
-                    messages_with_system = [
-                        {
-                            "role": "system",
-                            "content": system_content
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image"},
-                                {"type": "text", "text": prompt}
-                            ]
-                        }
-                    ]
-                    
-                    input_text = self.processor.apply_chat_template(
-                        messages_with_system,
-                        add_generation_prompt=True,
-                        return_tensors=None  # テキストを返す
-                    )
-                    print("システムメッセージを含むチャットテンプレートを適用しました")
-                except Exception as system_template_error:
-                    print(f"システムテンプレート適用エラー: {system_template_error}")
-                    # 最終フォールバック：直接テンプレートを構築
-                    if is_japanese:
-                        input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-                    else:
-                        input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-                    print("フォールバック：最小限のテンプレートを手動で適用しました")
+                print(f"チャットテンプレート適用状況: 標準テンプレート使用")
+            except Exception as e:
+                print(f"標準テンプレート適用エラー: {e}")
+                # フォールバック：直接テンプレートを構築
+                input_text = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n<|image|>{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                print("フォールバック：手動テンプレートを適用しました")
                 
             print(f"チャットテンプレート適用後: {input_text[:100]}...")
 
             try:
-                # 画像とテキストを統合して処理
-                model_inputs = self.processor(
-                    image_pil,
-                    input_text,
-                    return_tensors="pt"
-                )
-
-                # テンソルをモデルのデバイスに移動
-                for k, v in model_inputs.items():
-                    if isinstance(v, torch.Tensor):
-                        model_inputs[k] = v.to(device)
-
-                # 入力テンソルの形状確認
-                print(f"pixel_values: 形状={model_inputs['pixel_values'].shape}")
-
-                # 一部のデバイスやモデル構成では6次元を期待する場合がある
-                if 'pixel_values' in model_inputs and len(model_inputs['pixel_values'].shape) == 5:
-                    # [batch_size, num_tiles, channels, height, width] -> [batch_size, 1, num_tiles, channels, height, width]
-                    model_inputs['pixel_values'] = model_inputs['pixel_values'].unsqueeze(1)
-                    print(f"pixel_values (リシェイプ後): 形状={model_inputs['pixel_values'].shape}")
-
-                # aspect_ratio_ids と aspect_ratio_mask が存在しない場合は作成
-                if 'aspect_ratio_ids' not in model_inputs and 'pixel_values' in model_inputs:
-                    # デフォルト: 1.0のアスペクト比でタイル全体使用とマーク
-                    b, n_media, n_tiles = model_inputs['pixel_values'].shape[:3]
-                    model_inputs['aspect_ratio_ids'] = torch.zeros(
-                        (b, n_media, n_tiles), dtype=torch.long, device=device)
-                    model_inputs['aspect_ratio_mask'] = torch.ones(
-                        (b, n_media, n_tiles), dtype=torch.long, device=device)
-                    print("aspect_ratio_ids と aspect_ratio_mask を生成しました")
-
+                # モデルに画像とテキストを入力
+                with torch.inference_mode():
+                    inputs = self.processor(
+                        images=image_pil,
+                        text=input_text,
+                        return_tensors="pt",
+                        padding=True
+                    )
+                    
+                    # テンソルをモデルのデバイスに移動
+                    for k, v in inputs.items():
+                        if isinstance(v, torch.Tensor):
+                            inputs[k] = v.to(device)
+                    
+                    # 入力テンソルの形状確認
+                    if 'pixel_values' in inputs:
+                        print(f"pixel_values: 形状={inputs['pixel_values'].shape}")
+                
                 # GPUメモリ使用状況をデバッグ出力（推論前）
                 if torch.cuda.is_available() and device.type == 'cuda':
                     print(f"生成前のGPUメモリ: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
@@ -886,36 +829,25 @@ class LISAForCausalLM(nn.Module):
                     # 日本語生成の最適パラメータ
                     print("日本語プロンプトを検出: 日本語生成パラメータを適用")
                     generation_kwargs = {
-                        'do_sample': False,  # 決定的な生成
-                        'temperature': 0.1,  # 非常に低温
-                        'top_p': 0.95,       # 高いトップ確率
-                        'repetition_penalty': 1.8,  # 繰り返しを強く抑制
+                        'do_sample': True,
+                        'temperature': 0.2,     # 低温設定
+                        'top_p': 0.9,
+                        'repetition_penalty': 1.0,  # 繰り返しペナルティは最小に
                         'max_new_tokens': max_new_tokens,
-                        'num_beams': max(1, num_beams if num_beams is not None else 1),
+                        'num_beams': 1,         # ビームサーチはオフ
                         'use_cache': True,
-                        'eos_token_id': self.processor.tokenizer.eos_token_id,
-                        'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
-                        'early_stopping': num_beams > 1 if num_beams is not None else False,
-                        'no_repeat_ngram_size': 4,  # 4-gramの繰り返しを防止
-                        'bad_words_ids': None,  # 生成を制限する単語なし
                     }
                 else:
                     # 英語生成の最適パラメータ
                     print("英語プロンプトを検出: 英語生成パラメータを適用")
                     generation_kwargs = {
-                        'do_sample': True,   # サンプリングを有効化
-                        'temperature': 0.7,  # 適度な温度
-                        'top_p': 0.9,        # バランスの取れたトップ確率
-                        'repetition_penalty': 1.2,  # 適度な繰り返し抑制
+                        'do_sample': True,
+                        'temperature': 0.7,
+                        'top_p': 0.9,
+                        'repetition_penalty': 1.0,
                         'max_new_tokens': max_new_tokens,
-                        'num_beams': max(1, num_beams if num_beams is not None else 1),
+                        'num_beams': 1,
                         'use_cache': True,
-                        'eos_token_id': self.processor.tokenizer.eos_token_id,
-                        'pad_token_id': self.processor.tokenizer.pad_token_id if hasattr(self.processor.tokenizer, 'pad_token_id') else self.processor.tokenizer.eos_token_id,
-                        'early_stopping': num_beams > 1 if num_beams is not None else False,
-                        'no_repeat_ngram_size': 3,  # 3-gramの繰り返しを防止
-                        'bad_words_ids': None,  # 生成を制限する単語なし
-                        'remove_invalid_values': True,  # 無効な値を除去
                     }
 
                 # ユーザー指定のパラメータで上書き（指定がある場合のみ）
@@ -944,170 +876,107 @@ class LISAForCausalLM(nn.Module):
                 if self.use_deepspeed and hasattr(self.model, 'module'):
                     print("DeepSpeedモデルを使用して生成します...")
                     
-                    # 入力IDsとattention_maskを取得
-                    input_ids = model_inputs.get('input_ids', None)
-                    attention_mask = model_inputs.get('attention_mask', None)
-                    
-                    # 生成に必要な引数を設定
-                    generate_inputs = {
-                        **model_inputs,
-                        **generation_kwargs
-                    }
-                    
-                    # Llama 3.2 Visionに最適化した生成パラメータ
-                    # オプション：元の温度とtop_pを上書き
-                    if 'temperature' not in generation_kwargs:
-                        generate_inputs['temperature'] = 0.1  # 低温で決定的な生成
-                    if 'top_p' not in generation_kwargs:
-                        generate_inputs['top_p'] = 0.9  # トップ確率を高めに
-                    
-                    # RepetitionPenaltyを追加
-                    if 'repetition_penalty' not in generation_kwargs:
-                        generate_inputs['repetition_penalty'] = 1.5  # 繰り返しを避ける
-                        
-                    # デコード設定の最適化
-                    generate_inputs['bad_words_ids'] = None  # 生成を制限する単語なし
-                    generate_inputs['remove_invalid_values'] = True  # 無効な値を除去
-                    
-                    # 生成を実行
                     try:
+                        # モデルで重みの共有を確認し、必要に応じて修正
+                        if hasattr(self.model.module, "tie_weights") and callable(getattr(self.model.module, "tie_weights")):
+                            self.model.module.tie_weights()
+                            print("モデルの重みを結合しました")
+                        
                         # モジュールの generate メソッドを呼び出す
                         if hasattr(self.model.module, 'generate'):
                             print("model.module.generate()を使用します")
                             with torch.no_grad():
-                                generate_ids = self.model.module.generate(**generate_inputs)
+                                # deepspeedオプティマイザ状態をクリア
+                                if hasattr(self.model, "optimizer") and self.model.optimizer is not None:
+                                    self.model.optimizer.zero_grad()
+                                
+                                # ダミー推論を行ってDeepSpeedの内部状態を初期化（問題報告への対応）
+                                _ = self.model.module.forward(**{k: v[:1] for k, v in inputs.items()})
+                                
+                                # 本推論実行
+                                generate_ids = self.model.module.generate(
+                                    **inputs,
+                                    **generation_kwargs
+                                )
                         else:
-                            # なければforwardを使った手動生成
-                            print("手動の生成を実行します")
-                            with torch.no_grad():
-                                # モデルの順伝播
-                                outputs = self.model(**model_inputs)
-                                # 最後のトークンを次トークンの予測に使用
-                                next_token_logits = outputs.logits[:, -1, :]
-                                # サンプリング
-                                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-                                # 入力に追加
-                                generate_ids = torch.cat([input_ids, next_token], dim=-1)
+                            print("generate()メソッドが見つかりません")
+                            raise ValueError("モデルにgenerate()メソッドがありません")
                     except Exception as e:
                         print(f"モデル生成時にエラー発生: {str(e)}")
-                        # フォールバック
-                        generate_ids = input_ids
+                        print("詳細情報:", traceback.format_exc())
+                        raise e
                 
                 # 標準のPyTorchモデルの場合
                 else:
                     print("標準のPyTorchモデルを使用して生成します...")
                     
-                    # 生成に必要な引数を設定
-                    generate_inputs = {
-                        **model_inputs,
-                        **generation_kwargs
-                    }
-                    
                     try:
+                        # モデルで重みの共有を確認し、必要に応じて修正
+                        if hasattr(self.model, "tie_weights") and callable(getattr(self.model, "tie_weights")):
+                            self.model.tie_weights()
+                            print("モデルの重みを結合しました")
+                        
                         # モデルが.generateメソッドを持っているか確認
                         if hasattr(self.model, 'generate'):
                             print("model.generate()を使用します")
                             with torch.no_grad():
-                                generate_ids = self.model.generate(**generate_inputs)
+                                generate_ids = self.model.generate(
+                                    **inputs,
+                                    **generation_kwargs
+                                )
                         else:
-                            print("generate()メソッドが見つかりません - 手動の生成を実行します")
-                            with torch.no_grad():
-                                # モデルの順伝播
-                                outputs = self.model(**model_inputs)
-                                # 最後のトークンを次トークンの予測に使用
-                                next_token_logits = outputs.logits[:, -1, :]
-                                # サンプリング
-                                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-                                # 入力に追加
-                                generate_ids = torch.cat([model_inputs['input_ids'], next_token], dim=-1)
+                            print("generate()メソッドが見つかりません")
+                            raise ValueError("モデルにgenerate()メソッドがありません")
                     except Exception as e:
                         print(f"モデル生成時にエラー発生: {str(e)}")
-                        # フォールバック - 入力をそのまま返す
-                        generate_ids = model_inputs.get('input_ids', torch.zeros(1, 1, dtype=torch.long, device=device))
+                        print("詳細情報:", traceback.format_exc())
+                        raise e
                 
                 # 生成されたトークンをデコード
                 try:
-                    # モデルのトークナイザを使ってデコード
-                    # 特殊トークンを保持（<seg>のみ明示的に保持）
-                    special_tokens_to_keep = [self.seg_token]
-                    all_special_tokens = set(self.processor.tokenizer.all_special_tokens)
-                    skip_special_tokens = all_special_tokens - set(special_tokens_to_keep)
-                    
-                    print(f"スキップする特殊トークン数: {len(skip_special_tokens)}")
-                    print(f"保持する特殊トークン: {special_tokens_to_keep}")
-                    
                     # トークンIDから文字列にデコード
-                    raw_text = self.processor.tokenizer.decode(
-                        generate_ids[0], 
-                        skip_special_tokens=False,  # まず特殊トークンを保持
+                    raw_text = self.processor.batch_decode(
+                        generate_ids, 
+                        skip_special_tokens=False,  # まず特殊トークンを保持してデコード
                         clean_up_tokenization_spaces=True
-                    )
+                    )[0]
                     
                     print(f"生のデコード結果（処理前）の長さ: {len(raw_text)}")
+                    print(f"生のデコード結果（処理前）の一部: {raw_text[:150]}...")
                     
-                    # モデル固有のパターンでアシスタント応答を抽出
-                    # Llama 3.2 Vision のパターンを優先的に検索
-                    assistant_markers = [
-                        ("<|start_header_id|>assistant<|end_header_id|>", "<|eot_id|>"),
-                        ("<|im_start|>assistant", "<|im_end|>"),
-                        ("assistant:", "\n\n"),
-                        ("Assistant:", "\n"),
-                    ]
+                    # アシスタント応答を抽出（正規表現を使用）
+                    assistant_pattern = r'<\|start_header_id\|>assistant<\|end_header_id\|>(.*?)(?:<\|eot_id\|>|$)'
+                    assistant_matches = re.findall(assistant_pattern, raw_text, re.DOTALL)
                     
-                    # 応答抽出
-                    extracted_text = None
-                    for start_marker, end_marker in assistant_markers:
-                        if start_marker in raw_text:
-                            start_idx = raw_text.find(start_marker) + len(start_marker)
-                            # 終了マーカーが見つかればそこまで、なければ最後まで
-                            if end_marker in raw_text[start_idx:]:
-                                end_idx = raw_text.find(end_marker, start_idx)
-                                extracted_text = raw_text[start_idx:end_idx].strip()
-                            else:
-                                extracted_text = raw_text[start_idx:].strip()
-                            break
-                    
-                    # 抽出に失敗した場合の代替処理：seg トークンまでの全テキスト
-                    if not extracted_text and self.seg_token in raw_text:
-                        seg_idx = raw_text.find(self.seg_token)
-                        # セグメンテーショントークンの前のテキストを取得
-                        extracted_text = raw_text[:seg_idx].strip()
-                        # セグメンテーショントークンも含める
-                        extracted_text += f" {self.seg_token}"
-                    
-                    # それでも抽出できなかった場合、生のテキストを使用
-                    if not extracted_text:
-                        extracted_text = raw_text
-                        print("警告: アシスタント応答の抽出に失敗しました。生テキストを使用します。")
-                    
-                    # 最終的なクリーンアップ
-                    # 1. 特殊トークンの削除（<seg>は除く）
-                    # 2. HTML/XMLタグのような構造の削除
-                    # 3. 改行と空白の正規化
-                    
-                    # 1. 既知の特殊トークンを削除（<seg>は保持）
-                    special_tokens_to_remove = [
-                        "<|begin_of_text|>", "<|end_of_text|>", 
-                        "<|start_header_id|>", "<|end_header_id|>",
-                        "<|eot_id|>", "<|im_start|>", "<|im_end|>",
-                        "<|endoftext|>", "<pad>", "system", "user", "assistant"
-                    ]
-                    
-                    for token in special_tokens_to_remove:
-                        extracted_text = extracted_text.replace(token, "")
-                    
-                    # 2. HTMLタグ風の構造を削除（<xxx>形式、<seg>は除外）
-                    extracted_text = re.sub(r'<(?!seg\b)[^>]*>', '', extracted_text)
-                    
-                    # 3. 改行と空白の正規化
-                    extracted_text = re.sub(r'\n\s*\n', '\n\n', extracted_text)  # 複数改行→二重改行
-                    extracted_text = re.sub(r'\s+', ' ', extracted_text)  # 連続空白→単一空白
-                    extracted_text = extracted_text.strip()  # 前後の空白を削除
+                    if assistant_matches:
+                        # 最後のアシスタント応答を使用
+                        extracted_text = assistant_matches[-1].strip()
+                        print(f"アシスタント応答が正常に抽出されました: {len(extracted_text)}文字")
+                    else:
+                        # 抽出失敗時の別パターン試行
+                        alt_patterns = [
+                            r'assistant\s*:(.*?)(?:user:|$)',
+                            r'<assistant>(.*?)</assistant>',
+                            r'\|\s*assistant\s*\|(.*?)(?:\||$)'
+                        ]
+                        
+                        for pattern in alt_patterns:
+                            matches = re.findall(pattern, raw_text, re.DOTALL)
+                            if matches:
+                                extracted_text = matches[-1].strip()
+                                print(f"代替パターンでアシスタント応答を抽出: {len(extracted_text)}文字")
+                                break
+                        else:
+                            # 入力以降の部分を抽出
+                            print("パターンマッチ失敗: 入力以降のテキストを使用")
+                            input_len = len(inputs["input_ids"][0])
+                            response_ids = generate_ids[0][input_len:]
+                            extracted_text = self.processor.decode(response_ids, skip_special_tokens=True)
+                            print(f"代替方法で応答を抽出: {len(extracted_text)}文字")
                     
                     # セグメンテーショントークンが処理中に消えていたら復元
                     if self.seg_token not in extracted_text and raw_text.find(self.seg_token) != -1:
-                        # 元のテキストでの位置を参考に適切な位置に挿入
-                        # 文末に追加するのがシンプル
+                        # セグメンテーショントークンを文末に追加
                         extracted_text = extracted_text.rstrip() + f" {self.seg_token}"
                         print(f"セグメンテーショントークン {self.seg_token} を復元しました")
                     
@@ -1127,7 +996,6 @@ class LISAForCausalLM(nn.Module):
                     print(f"詳細なトレースバック:\n{traceback_str}")
                     
                     # エラー回復：最低限のテキストを提供
-                    # seg_tokenだけは確実に含める
                     generated_text = f"テキスト生成エラーが発生しました。{self.seg_token}"
                 
                 # セグメンテーショントークンの位置を検索
@@ -1146,285 +1014,182 @@ class LISAForCausalLM(nn.Module):
                     print(f"<seg>トークン位置: {seg_positions}")
                     
                     # <seg>トークンが見つかった場合、マスクを生成
-                    for batch_idx, pos in seg_positions:
-                        try:
+                    if seg_positions:
+                        for batch_idx, pos in seg_positions:
                             # この位置までのシーケンスを抽出
                             input_ids_segment = generate_ids[batch_idx, :pos+1].unsqueeze(0)
                             attention_mask_segment = torch.ones_like(input_ids_segment)
                             
                             # フォワードパスを実行して隠れ状態を取得
                             with torch.no_grad():
-                                # テンソルの形状とデバイスを確認
-                                pixel_values_segment = model_inputs['pixel_values'][:1]
-                                aspect_ratio_ids_segment = model_inputs['aspect_ratio_ids'][:1] if 'aspect_ratio_ids' in model_inputs else None
-                                aspect_ratio_mask_segment = model_inputs['aspect_ratio_mask'][:1] if 'aspect_ratio_mask' in model_inputs else None
-
-                                print(f"フォワードパス用 pixel_values: 形状={pixel_values_segment.shape}")
-                                
-                                # NaNとInfをチェックして修正
-                                for tensor_name, tensor in [
-                                    ("pixel_values", pixel_values_segment),
-                                    ("aspect_ratio_ids", aspect_ratio_ids_segment),
-                                    ("aspect_ratio_mask", aspect_ratio_mask_segment)
-                                ]:
-                                    if tensor is not None:
-                                        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                                            print(f"警告: {tensor_name}にNaNまたはInf値が含まれています。修正します。")
-                                            if tensor_name == "pixel_values":
-                                                pixel_values_segment = torch.nan_to_num(
-                                                    pixel_values_segment, nan=0.0, posinf=1.0, neginf=0.0)
-                                            elif tensor_name == "aspect_ratio_ids":
-                                                aspect_ratio_ids_segment = torch.nan_to_num(
-                                                    aspect_ratio_ids_segment, nan=0.0, posinf=1.0, neginf=0.0)
-                                            elif tensor_name == "aspect_ratio_mask":
-                                                aspect_ratio_mask_segment = torch.nan_to_num(
-                                                    aspect_ratio_mask_segment, nan=0.0, posinf=1.0, neginf=0.0)
-                                
                                 # モデルがモジュール（DeepSpeed）かどうかチェック
                                 model_for_inference = self.model.module if hasattr(self.model, 'module') else self.model
                                 
-                                # GPUでの処理を試みる
+                                # 入力テンソルの準備
+                                forward_inputs = {
+                                    'input_ids': input_ids_segment.to(device),
+                                    'attention_mask': attention_mask_segment.to(device),
+                                }
+                                
+                                # pixel_valuesを追加（必要な場合）
+                                if 'pixel_values' in inputs:
+                                    forward_inputs['pixel_values'] = inputs['pixel_values'].to(device)
+                                
+                                # その他の必要な入力があれば追加
+                                for k, v in inputs.items():
+                                    if k not in forward_inputs and k != 'input_ids' and k != 'attention_mask':
+                                        forward_inputs[k] = v.to(device)
+                                
+                                # 出力にhidden_statesを含めるよう設定
+                                forward_inputs['output_hidden_states'] = True
+                                forward_inputs['return_dict'] = True
+                                
+                                # モデルの順伝播を実行
                                 try:
-                                    outputs = model_for_inference(
-                                        input_ids=input_ids_segment.to(device),
-                                        attention_mask=attention_mask_segment.to(device),
-                                        pixel_values=pixel_values_segment.to(device),
-                                        aspect_ratio_ids=aspect_ratio_ids_segment.to(device) if aspect_ratio_ids_segment is not None else None,
-                                        aspect_ratio_mask=aspect_ratio_mask_segment.to(device) if aspect_ratio_mask_segment is not None else None,
-                                        output_hidden_states=True,
-                                        return_dict=True
-                                    )
-                                    
+                                    outputs = model_for_inference(**forward_inputs)
                                     print("GPUでの隠れ状態取得に成功しました")
-                                    
                                 except Exception as e:
                                     print(f"GPUでの隠れ状態取得中にエラー: {str(e)}")
-                                    print("CPUでの処理に切り替えます")
-                                    
-                                    # CPUに移動して再試行
-                                    try:
-                                        # モデルをCPUに移動（一時的に）
-                                        model_cpu = model_for_inference.to('cpu')
-                                        
-                                        outputs = model_cpu(
-                                            input_ids=input_ids_segment.cpu(),
-                                            attention_mask=attention_mask_segment.cpu(),
-                                            pixel_values=pixel_values_segment.cpu(),
-                                            aspect_ratio_ids=aspect_ratio_ids_segment.cpu() if aspect_ratio_ids_segment is not None else None,
-                                            aspect_ratio_mask=aspect_ratio_mask_segment.cpu() if aspect_ratio_mask_segment is not None else None,
-                                            output_hidden_states=True,
-                                            return_dict=True
-                                        )
-                                        
-                                        # 処理後、モデルをGPUに戻す
-                                        model_for_inference.to(device)
-                                        print("CPUでの隠れ状態取得に成功しました")
-                                        
-                                    except Exception as cpu_error:
-                                        print(f"CPUでの処理も失敗しました: {str(cpu_error)}")
-                                        # ダミーの隠れ状態とマスク情報を返し、次のトークンへ
-                                        # 出力画像サイズとしてsam_image_sizeを使用
-                                        masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
-                                        continue  # 次のトークンへ
-
+                                    print("より詳細なエラー情報:", traceback.format_exc())
+                                    raise e
+                                
                                 # 隠れ状態を取得
-                                # 最後の層から<seg>トークンの最後の隠れ状態を抽出
                                 if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                                    hidden_states = outputs.hidden_states[-1]
-                                    seg_hidden_state = hidden_states[0, -1]  # バッチ0、最後の位置
+                                    # 最後の層の最後の位置（<seg>トークン）の隠れベクトルを取得
+                                    last_hidden_states = outputs.hidden_states[-1]
+                                    seg_hidden_state = last_hidden_states[0, -1]
                                     
                                     print(f"<seg>トークンの隠れ状態: 形状={seg_hidden_state.shape}")
                                     
-                                    # SAMの予測に使用する形式にプロジェクション
+                                    # セグメンテーション投影を適用
                                     prompt_embedding = self.seg_projection(seg_hidden_state)
                                     
-                                    # GPUのデータ型に合わせる（Half精度で動作している場合はHalfに合わせる）
-                                    device_dtype = next(self.sam.parameters()).dtype
-                                    prompt_embedding = prompt_embedding.to(dtype=device_dtype)
+                                    # NaN/Infチェック
+                                    if torch.isnan(prompt_embedding).any() or torch.isinf(prompt_embedding).any():
+                                        print("警告: 埋め込みにNaNまたはInf値があります。置換します。")
+                                        prompt_embedding = torch.nan_to_num(prompt_embedding)
                                     
-                                    print(f"プロンプト埋め込みのデータ型: {prompt_embedding.dtype}, SAMモデルのデータ型: {device_dtype}")
-                                    
-                                    # SAMへの入力を準備
-                                    # 画像特徴マップがdeviceと一致していることを確認
-                                    sam_image_embedding = sam_image_embedding.to(prompt_embedding.device)
-                                    
-                                    # プロンプト埋め込みの形状調整
-                                    # SAMモデルが期待する形式に変換 - [1, 1, 256]の形状にする
-                                    sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
-                                    print(f"SAMへの入力 - sparse_embeddings: 形状={sparse_embeddings.shape}")
-                                    
-                                    try:
-                                        # 位置エンコーディングの形状を取得
-                                        image_pe = self.sam.prompt_encoder.get_dense_pe()
-                                        
-                                        # sparse_embeddingsの次元がimage_peの次元と一致しているか確認
-                                        # SAMの位置エンコーディングはembedding_dimの次元を持っているはず
-                                        if sparse_embeddings.shape[-1] != image_pe.shape[1]:
-                                            print(f"警告: プロンプト埋め込み次元 ({sparse_embeddings.shape[-1]}) と位置エンコーディング次元 ({image_pe.shape[1]}) が一致しません")
-                                            print("次元を一致させるためにLinear投影を行います")
-                                            # 線形層で次元を調整（256→256）
-                                            transformer_dim = image_pe.shape[1]
-                                            if not hasattr(self, "dim_adjustment"):
-                                                self.dim_adjustment = nn.Linear(
-                                                    sparse_embeddings.shape[-1], 
-                                                    transformer_dim
-                                                ).to(device=sparse_embeddings.device, dtype=sparse_embeddings.dtype)
-                                            sparse_embeddings = self.dim_adjustment(sparse_embeddings)
-                                            print(f"調整後のsparse_embeddings: 形状={sparse_embeddings.shape}")
-                                        
-                                        # image_peを適切なデバイスと型に移動
-                                        image_pe = image_pe.to(device=sparse_embeddings.device, dtype=sparse_embeddings.dtype)
-                                        
-                                        # テンソルのサイズを表示して確認
-                                        print(f"image_peのシェイプ: {image_pe.shape}")
-                                        print(f"sam_image_embeddingのシェイプ: {sam_image_embedding.shape}")
-                                    except Exception as pe_error:
-                                        print(f"位置エンコーディング処理エラー: {pe_error}")
-                                        # エラー時は処理を続行し、後続のマスク生成部分でも適切に対応できるようにする
-                                    
-                                    try:
-                                        # image_peの形状をsam_image_embeddingに合わせてリサイズ
-                                        if 'image_pe' in locals() and image_pe.shape[2] != sam_image_embedding.shape[2] or image_pe.shape[3] != sam_image_embedding.shape[3]:
-                                            print(f"image_peをリサイズします: {image_pe.shape} -> ({sam_image_embedding.shape[2]}, {sam_image_embedding.shape[3]})")
-                                            
-                                            # リサイズ実行
-                                            try:
-                                                image_pe_resized = F.interpolate(
-                                                    image_pe,
-                                                    size=(sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
-                                                    mode="bilinear",
-                                                    align_corners=False
-                                                )
-                                                image_pe = image_pe_resized
-                                                print(f"リサイズ後のimage_peのシェイプ: {image_pe.shape}")
-                                            except Exception as resize_error:
-                                                print(f"画像リサイズエラー: {resize_error}")
-                                                print("代替のリサイズ方法を試みます...")
-                                                
-                                                # 代替方法: 元のimage_peの寸法を使用して新しいサイズのテンソルを作成
-                                                try:
-                                                    # 新しいテンソルを作成し、双線形補間で値をコピー
-                                                    new_image_pe = torch.zeros(
-                                                        (image_pe.shape[0], image_pe.shape[1], 
-                                                         sam_image_embedding.shape[2], sam_image_embedding.shape[3]),
-                                                        device=image_pe.device,
-                                                        dtype=image_pe.dtype
-                                                    )
-                                                    
-                                                    # 元の値を新しいテンソルにコピー（簡易的な方法）
-                                                    # 実際には双線形補間などが適しているが、簡易的なサイズ調整として
-                                                    for i in range(sam_image_embedding.shape[2]):
-                                                        for j in range(sam_image_embedding.shape[3]):
-                                                            # インデックスを正規化して元の位置を計算
-                                                            orig_i = int(i * image_pe.shape[2] / sam_image_embedding.shape[2])
-                                                            orig_j = int(j * image_pe.shape[3] / sam_image_embedding.shape[3])
-                                                            # 境界チェック
-                                                            orig_i = min(orig_i, image_pe.shape[2] - 1)
-                                                            orig_j = min(orig_j, image_pe.shape[3] - 1)
-                                                            # 値をコピー
-                                                            new_image_pe[:, :, i, j] = image_pe[:, :, orig_i, orig_j]
-                                                    
-                                                    image_pe = new_image_pe
-                                                    print(f"手動リサイズ後のimage_peのシェイプ: {image_pe.shape}")
-                                                except Exception as manual_resize_error:
-                                                    print(f"手動リサイズ失敗: {manual_resize_error}")
-                                                    # 最終手段：元のサイズを使用
-                                                    print("警告: 位置エンコーディングのリサイズに失敗しました。元のサイズを使用します。")
-                                    except Exception as resize_outer_error:
-                                        print(f"画像リサイズ全体のエラー: {resize_outer_error}")
-                                        # エラー時も処理を続行
-
-                                # 空のdense_prompt_embeddingsを作成（Noneではなく空のテンソルを使用）
-                                # [B, C, H, W]形式のゼロテンソルを作成
-                                # 画像埋め込みから適切な形状を取得
-                                b, c, h, w = sam_image_embedding.shape
-                                dense_prompt_embeddings = torch.zeros(
-                                    (b, c, h, w), 
-                                    device=sam_image_embedding.device, 
-                                    dtype=sam_image_embedding.dtype
-                                )
-                                
-                                # SAMモデルでマスクを予測
-                                try:
-                                    masks_predictions, iou_predictions = self.sam.mask_decoder(
-                                        image_embeddings=sam_image_embedding,
-                                        image_pe=image_pe,
-                                        sparse_prompt_embeddings=sparse_embeddings,
-                                        dense_prompt_embeddings=dense_prompt_embeddings,
-                                        multimask_output=False,
-                                    )
-                                    print("マスク予測成功！")
-                                    
-                                    # マスク予測結果がNaNまたはInfを含んでいないか確認
-                                    if torch.isnan(masks_predictions).any() or torch.isinf(masks_predictions).any():
-                                        print("警告: マスク予測にNaNまたはInf値が含まれています。0に置き換えます。")
-                                        masks_predictions = torch.nan_to_num(masks_predictions, nan=0.0, posinf=1.0, neginf=0.0)
-                                    
-                                    # マスクを一時的に1024x1024サイズにリサイズ
-                                    mask_1024 = F.interpolate(
-                                        masks_predictions,
-                                        size=(self.sam_image_size, self.sam_image_size),
-                                        mode="bilinear",
-                                        align_corners=False,
+                                    # SAMモデルのデータ型に変換
+                                    prompt_embedding = prompt_embedding.to(
+                                        device=device,
+                                        dtype=next(self.sam.parameters()).dtype
                                     )
                                     
-                                    # 入力画像の元のサイズ（前処理前）を取得
-                                    if hasattr(self, 'original_image_size'):
-                                        orig_h, orig_w = self.original_image_size
-                                        print(f"マスクをオリジナル画像サイズ ({orig_h}, {orig_w}) にリサイズします")
-                                        
-                                        # マスクを元の画像サイズにリサイズ
-                                        mask = F.interpolate(
-                                            masks_predictions,
-                                            size=(orig_h, orig_w),
-                                            mode="bilinear",
-                                            align_corners=False,
+                                    # SAM用の画像埋め込みを取得
+                                    with torch.no_grad():
+                                        # SAMの画像埋め込みをデバイスと型に合わせる
+                                        sam_image_embedding = sam_image_embedding.to(
+                                            device=prompt_embedding.device,
+                                            dtype=prompt_embedding.dtype
                                         )
-                                    else:
-                                        print("警告: オリジナル画像サイズ情報がありません。デフォルトサイズを使用します。")
-                                        mask = mask_1024
-                                    
-                                    # マスクのシグモイド活性化と閾値処理
-                                    mask = torch.sigmoid(mask) > 0.5
-                                    
-                                    # マスク情報をリストに追加
-                                    masks.append(mask.cpu().numpy()[0, 0])
-                                    print(f"マスク生成成功: 形状={mask.shape}")
-                                    
-                                except Exception as e:
-                                    print(f"マスク生成中にエラー: {e}")
-                                    
-                                    # オリジナル画像サイズが設定されている場合、そのサイズでダミーマスクを生成
-                                    if hasattr(self, 'original_image_size'):
-                                        h, w = self.original_image_size
-                                        print(f"オリジナルサイズ ({h}x{w}) のダミーマスクを生成")
-                                        dummy_mask = np.zeros((h, w), dtype=np.float32)
                                         
-                                        # ダミーマスクに円を追加して視覚的に確認しやすくする
-                                        center_y, center_x = h // 2, w // 2
-                                        radius = min(h, w) // 4
-                                        y, x = np.ogrid[:h, :w]
-                                        dist_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-                                        circle_mask = dist_from_center <= radius
-                                        dummy_mask[circle_mask] = 1.0
+                                        # プロンプト埋め込みを適切な形状に変形
+                                        sparse_embeddings = prompt_embedding.unsqueeze(0).unsqueeze(0)
                                         
-                                        masks.append(dummy_mask)
-                                        print(f"ダミーマスク生成完了: 形状={dummy_mask.shape}")
-
-                        except Exception as segment_error:
-                            print(f"セグメント処理中にエラー: {str(segment_error)}")
-                            # エラー時のフォールバック
-                            masks.append(np.zeros((self.sam_image_size, self.sam_image_size), dtype=np.uint8))
-                
+                                        # 位置エンコーディングを取得
+                                        image_pe = self.sam.prompt_encoder.get_dense_pe()
+                                        image_pe = image_pe.to(
+                                            device=prompt_embedding.device,
+                                            dtype=prompt_embedding.dtype
+                                        )
+                                        
+                                        # 位置エンコーディングを画像埋め込みに合わせてリサイズ
+                                        if image_pe.shape[2:] != sam_image_embedding.shape[2:]:
+                                            image_pe = F.interpolate(
+                                                image_pe,
+                                                size=sam_image_embedding.shape[2:],
+                                                mode='bilinear',
+                                                align_corners=False
+                                            )
+                                        
+                                        # 空の密なプロンプト埋め込みを作成
+                                        b, c, h, w = sam_image_embedding.shape
+                                        dense_embeddings = torch.zeros(
+                                            (b, c, h, w),
+                                            device=sam_image_embedding.device,
+                                            dtype=sam_image_embedding.dtype
+                                        )
+                                        
+                                        # マスクデコーダを使用してマスクを予測
+                                        try:
+                                            mask_predictions, _ = self.sam.mask_decoder(
+                                                image_embeddings=sam_image_embedding,
+                                                image_pe=image_pe,
+                                                sparse_prompt_embeddings=sparse_embeddings,
+                                                dense_prompt_embeddings=dense_embeddings,
+                                                multimask_output=False
+                                            )
+                                            
+                                            print("マスク予測成功！")
+                                            
+                                            # マスクを元の画像サイズにリサイズ
+                                            mask = F.interpolate(
+                                                mask_predictions,
+                                                size=self.original_image_size,
+                                                mode='bilinear',
+                                                align_corners=False
+                                            )
+                                            
+                                            # シグモイドを適用して閾値処理
+                                            mask = torch.sigmoid(mask) > 0.5
+                                            
+                                            # マスクをCPU、NumPy配列に変換
+                                            mask_np = mask.cpu().numpy()[0, 0]
+                                            masks.append(mask_np)
+                                            
+                                            print(f"マスク生成成功: 形状={mask_np.shape}")
+                                            
+                                        except Exception as mask_error:
+                                            print(f"マスク生成中にエラー: {str(mask_error)}")
+                                            print("詳細エラー情報:", traceback.format_exc())
+                                            
+                                            # ダミーマスクを作成（オリジナル画像サイズで）
+                                            h, w = self.original_image_size
+                                            dummy_mask = np.zeros((h, w), dtype=np.float32)
+                                            masks.append(dummy_mask)
+                                            
+                                            print(f"代替ダミーマスクを生成: 形状={dummy_mask.shape}")
+                                    
+                                else:
+                                    print("警告: モデル出力に隠れ状態が含まれていません")
+                                    # ダミーマスクを作成
+                                    h, w = self.original_image_size
+                                    dummy_mask = np.zeros((h, w), dtype=np.float32)
+                                    masks.append(dummy_mask)
+                        
+                        # マスクが生成されなかった場合のフォールバック
+                        if not masks:
+                            print("警告: マスクが生成されませんでした。ダミーマスクを作成します。")
+                            h, w = self.original_image_size
+                            dummy_mask = np.zeros((h, w), dtype=np.float32)
+                            masks.append(dummy_mask)
+                    
+                    # セグメンテーショントークンが見つからなかった場合
+                    else:
+                        print("警告: セグメンテーショントークンが見つかりませんでした。")
+                        print("テキスト内のセグメンテーショントークンを探索します...")
+                        
+                        if self.seg_token in generated_text:
+                            print(f"テキスト内で{self.seg_token}を検出しました。ダミーマスクを生成します。")
+                        else:
+                            print(f"テキスト内に{self.seg_token}が見つかりませんでした。これは予期しない状態です。")
+                            # セグメンテーショントークンを追加
+                            generated_text += f" {self.seg_token}"
+                        
+                        # ダミーマスクを作成
+                        h, w = self.original_image_size
+                        dummy_mask = np.zeros((h, w), dtype=np.float32)
+                        masks.append(dummy_mask)
+                    
                 except Exception as token_error:
                     print(f"トークン検索中にエラー: {str(token_error)}")
-                    # トークン検索エラー時のフォールバック
+                    print("詳細エラー情報:", traceback.format_exc())
+                    # エラー時のフォールバック
                     return {"masks": [], "text": generated_text}
             
             except Exception as process_error:
                 print(f"入力処理中にエラー: {str(process_error)}")
-                import traceback
-                traceback.print_exc()
+                print("詳細エラー情報:", traceback.format_exc())
                 return {"masks": [], "text": f"入力処理エラー: {str(process_error)}"}
             
             # 最終的な結果を返す
@@ -1433,7 +1198,6 @@ class LISAForCausalLM(nn.Module):
             
         except Exception as e:
             print(f"画像とテキストの処理中にエラーが発生しました: {str(e)}")
-            import traceback
             traceback.print_exc()
             return {"masks": [], "text": f"画像処理エラー: {str(e)}"}
 
@@ -1557,4 +1321,11 @@ def build_sam_vit_h(checkpoint=None):
     else:
         print("SAMチェックポイントが指定されていません - 学習済み重みなしで初期化します")
     return sam
+
+def image_to_base64(image):
+    """画像をbase64エンコードする補助関数"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return img_str
 
